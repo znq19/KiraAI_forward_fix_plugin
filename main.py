@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 _GROUP_SESSION_TYPES = {"gm"}
 _PRIVATE_SESSION_TYPES = {"dm"}
 
+# Segment types whose structure cannot be rebuilt from content (file upload,
+# nested forward, reply reference, card, music signature). These must keep
+# the original message ID node so NapCat preserves the structure.
+_ID_NODE_TYPES = {"file", "forward", "reply", "json", "music"}
+
 
 class ForwardFixPlugin(BasePlugin):
     """
@@ -24,18 +29,17 @@ class ForwardFixPlugin(BasePlugin):
       merge case via send_group_segments -> send_action("send_group_msg", ...)
       with {"type": "node"} segments. OneBot rejects node segments outside a
       forward node list with retcode 1400.
-    - Fix: intercept at after_xml_parse, drop the Forward element, and call
-      the dedicated OneBot API send_group_forward_msg / send_private_forward_msg
-      directly, bypassing the built-in sender.
 
-    Design:
-    - Invisible to the LLM: no new tools, no prompt changes.
-    - Non-destructive: only touches the actions list for Forward elements.
-    - No impact on other plugins: high priority, only handles Forward types.
-    - Silent by default: no feedback text on success or failure (configurable).
-    - Group / private chat: decided by the sid session type (gm / dm).
-    - Real media forwarding: references original messages by ID, QQ client
-      pulls the full original content automatically.
+    Second failure mode (fixed in v1.2.0):
+    - Sending nodes by {"id": ...} requires NapCat to look up each message's
+      sender; lookup fails with "has no valid sender user_id" when the ID is
+      not in NapCat's cache (stale / cross-session / hallucinated by the LLM).
+    - Fix: fetch the real message history via get_group_msg_history /
+      get_friend_msg_history, match IDs, and build content nodes
+      (user_id + time + content) for ordinary messages so no ID lookup is
+      needed. Special segments (file/forward/reply/card/music) keep ID nodes.
+      If fewer than half the IDs match history, the LLM likely hallucinated
+      them - fall back to the latest N history messages.
     """
 
     def __init__(self, ctx, cfg: dict):
@@ -185,12 +189,61 @@ class ForwardFixPlugin(BasePlugin):
                 logger.error("[forward_fix] adapter %r has no client", adapter_name)
                 return False
 
-            # Standard OneBot v11 node list; negative IDs are local message
-            # IDs and are valid here (the built-in sender failed because it
-            # sent node segments outside a forward node list, not because of
-            # the IDs themselves).
-            nodes = [{"type": "node", "data": {"id": str(mid)}} for mid in message_ids]
+            # 1. Fetch real history (read from NapCat's local DB, reliable).
+            fetch_count = max(len(message_ids) * 2, 20)
+            history = await self._fetch_history(
+                client, is_group, session_id, fetch_count
+            )
 
+            # 2. Match the LLM-provided IDs against history.
+            by_id = {}
+            for m in history:
+                mid = m.get("message_id")
+                if mid is not None:
+                    by_id[str(mid)] = m
+
+            nodes = []
+            matched = 0
+            for mid in message_ids:
+                msg = by_id.get(str(mid))
+                if msg is not None:
+                    matched += 1
+                    if self._needs_id_node(msg):
+                        # Structure-preserving segments keep the ID node.
+                        nodes.append({"type": "node", "data": {"id": str(mid)}})
+                    else:
+                        node = self._build_content_node(msg)
+                        if node:
+                            nodes.append(node)
+                            continue
+                        nodes.append({"type": "node", "data": {"id": str(mid)}})
+                else:
+                    # Unmatched ID: try the ID node as a last resort.
+                    nodes.append({"type": "node", "data": {"id": str(mid)}})
+
+            # 3. Low match rate -> the LLM hallucinated the IDs (common when
+            #    it was asked to "forward the latest N messages"). Fall back
+            #    to the latest N history messages as content nodes.
+            if matched < len(message_ids) * 0.5:
+                logger.warning(
+                    "[forward_fix] only %d/%d message IDs matched history; "
+                    "falling back to latest %d messages",
+                    matched, len(message_ids), len(message_ids),
+                )
+                nodes = []
+                for m in history[: len(message_ids)]:
+                    node = self._build_content_node(m)
+                    if node:
+                        nodes.append(node)
+                if not nodes:
+                    logger.error("[forward_fix] no usable history messages")
+                    return False
+
+            if not nodes:
+                logger.error("[forward_fix] no nodes to send")
+                return False
+
+            # 4. Send via the dedicated OneBot API.
             if is_group:
                 result = await client.send_action(
                     "send_group_forward_msg",
@@ -220,6 +273,59 @@ class ForwardFixPlugin(BasePlugin):
         except Exception as e:
             logger.error("[forward_fix] OneBot API raised: %s", e)
             return False
+
+    async def _fetch_history(
+        self, client, is_group: bool, session_id: str, count: int
+    ) -> list[dict]:
+        """Fetch recent message history via OneBot API (newest first)."""
+        try:
+            if is_group:
+                resp = await client.send_action(
+                    "get_group_msg_history",
+                    {"group_id": int(session_id), "count": count},
+                    timeout=15,
+                )
+            else:
+                resp = await client.send_action(
+                    "get_friend_msg_history",
+                    {"user_id": int(session_id), "count": count},
+                    timeout=15,
+                )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                messages = (resp.get("data") or {}).get("messages") or []
+                # Sort newest first by timestamp (some implementations return
+                # oldest first).
+                return sorted(
+                    messages, key=lambda m: m.get("time") or 0, reverse=True
+                )
+        except Exception as e:
+            logger.error("[forward_fix] history fetch failed: %s", e)
+        return []
+
+    @staticmethod
+    def _needs_id_node(msg: dict) -> bool:
+        """True if the message contains segments that need the original ID."""
+        for seg in msg.get("message") or []:
+            if seg.get("type") in _ID_NODE_TYPES:
+                return True
+        return False
+
+    @staticmethod
+    def _build_content_node(msg: dict) -> dict | None:
+        """Build a content node (user_id + time + content) from a history msg."""
+        segs = msg.get("message") or []
+        user_id = msg.get("user_id")
+        if not segs or not user_id:
+            return None
+        return {
+            "type": "node",
+            "data": {
+                # NapCat requires string user_id for forward nodes.
+                "user_id": str(user_id),
+                "time": int(msg.get("time") or 0),
+                "content": segs,
+            },
+        }
 
     async def _notify_failure(self, sid: str):
         """Optional user-visible failure notice (off by default)."""
