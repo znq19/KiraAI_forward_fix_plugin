@@ -102,6 +102,12 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 <details>
 <summary><b>更新日志</b></summary>
 
+### v1.5.3（2026-09-03）
+
+- **修复**：嵌套转发"点进去是空的"——forward 段不再保留 `{id: message_id}`（会被实现当 res_id 用，指向不存在的资源 → 空卡片），改为调 `get_forward_msg` 展开成**嵌套内容节点**（纯 node 数组），SnowLuma 的 `uploadRecursive` / NapCat 的 `uploadForwardedNodesPacket` 原生渲染多层转发卡片
+- **修复**：转发卡片时间显示 1970——节点 `time` 字段**总是提供**（消息时间或当前时间兜底），旧版 SnowLuma 省略 time 会渲染 1970
+- **保持**：reply 段改写 `{id: seq, seq: seq}`（QQ 权威序列），SnowLuma 渲染真实引用跳转、NapCat 按 seq 查真实消息显示完整引用条
+
 ### v1.5.2（2026-09-03）
 
 - **修复**：引用消息"成功且真实"——reply 段探测升级为**提取被引用消息的 QQ 权威序列（message_seq）**，并改写为 `{id: seq, seq: seq}`，三端全部真实渲染：
