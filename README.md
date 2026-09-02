@@ -21,8 +21,8 @@ retcode 1400: message segment "node" is only valid inside a forward node list
 - ✅ **对其他插件无影响**：高优先级执行，只匹配 Forward 类型
 - ✅ **完全静默**：默认成功/失败都不发提示文本（可配置）
 - ✅ **群聊 / 私聊都支持**：自动根据会话类型选择对应接口
-- ✅ **媒体真实转发**：所有普通消息（文本/图片/语音/视频/表情/引用）走内容节点原样重发，不依赖消息 ID 反查，兼容 NapCat / SnowLuma / LLOneBot；文件/嵌套转发/音乐卡片保留真实 ID 节点，结构完整
-- ✅ **防 LLM 幻觉 ID**：自动拉取真实历史匹配 ID，匹配率低时回退转发最近 N 条真实消息
+- ✅ **媒体真实转发**：所有普通消息（文本/图片/语音/视频/表情/引用）走内容节点原样重发（含真实昵称，群名片优先），不依赖消息 ID 反查，兼容 NapCat / SnowLuma / LLOneBot；文件/嵌套转发/音乐卡片保留真实 ID 节点，结构完整
+- ✅ **指哪打哪**：历史窗口外的消息 ID 逐个调 `get_msg` 精确解析，不再回退猜最近 N 条；仅当大部分 ID 无法解析时才回退（防 LLM 幻觉 ID）
 - ✅ **零配置**：装上即用，自动识别 QQ 平台
 
 ## 安装
@@ -67,8 +67,9 @@ LLM 输出 <forward merge="true">id1,id2</forward>
   1. 从消息链中移除 Forward 元素
   2. 自动拉取真实历史（get_group_msg_history / get_friend_msg_history）
   3. 匹配消息 ID，构造内容节点：
-     - 普通消息（含引用回复）→ 内容节点（user_id + time + content）原样重发
+     - 普通消息（含引用回复）→ 内容节点（user_id + nickname + time + content）原样重发
      - 文件/嵌套转发/音乐卡片 → 真实 ID 节点保留结构
+     - 历史窗口外的 ID → 逐个调 get_msg 精确解析，查不到才跳过
   4. 直接调用 OneBot 专用接口：
      - 群聊 → send_group_forward_msg
      - 私聊 → send_private_forward_msg
@@ -95,6 +96,15 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 
 <details>
 <summary><b>更新日志</b></summary>
+
+### v1.4.0（2026-09-02）
+
+- **修复**：合并转发中部分用户不显示 QQ 昵称（显示为 QQ 号）
+  - 原因：内容节点只传了 `user_id`，QQ 客户端无昵称时回退显示 QQ 号
+  - 修复：内容节点补充 `nickname` 字段（群名片优先，其次昵称）
+- **修复**：转发"指哪打哪"——LLM 引用历史窗口外的消息（如回复目标）时不再回退猜最近 N 条
+  - 新增：历史中未匹配的 ID 逐个调 `get_msg(id)` 精确解析（NapCat 走客户端数据库、SnowLuma 走消息存储），查得到就精确转发，查不到才跳过
+  - 仅当大部分 ID 都无法解析时才回退最近 N 条（防 LLM 幻觉 ID）
 
 ### v1.3.0（2026-09-02）
 

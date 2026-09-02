@@ -48,6 +48,14 @@ class ForwardFixPlugin(BasePlugin):
       rebuilt from content).
     - If fewer than half the IDs match history, the LLM likely hallucinated
       them - fall back to the latest N history messages.
+
+    v1.4.0 (precise resolution + nicknames):
+    - Content nodes now carry nickname (group card first, then nickname) so
+      QQ shows real names instead of QQ numbers.
+    - IDs not found in history are resolved one-by-one via get_msg(id)
+      instead of guessing: found -> build node from the fetched message;
+      not found -> skip that ID. Only when most IDs fail do we fall back to
+      the latest N history messages.
     """
 
     def __init__(self, ctx, cfg: dict):
@@ -213,29 +221,41 @@ class ForwardFixPlugin(BasePlugin):
 
             nodes = []
             matched = 0
+            missing = []
             for mid in message_ids:
                 msg = by_id.get(str(mid))
                 if msg is not None:
                     matched += 1
-                    if self._needs_id_node(msg):
-                        # Structure-preserving segments keep the ID node.
-                        nodes.append({"type": "node", "data": {"id": str(mid)}})
-                    else:
-                        node = self._build_content_node(msg)
-                        if node:
-                            nodes.append(node)
-                            continue
-                        nodes.append({"type": "node", "data": {"id": str(mid)}})
+                    node = self._build_node(msg, str(mid))
+                    if node:
+                        nodes.append(node)
                 else:
-                    # Unmatched ID: try the ID node as a last resort.
-                    nodes.append({"type": "node", "data": {"id": str(mid)}})
+                    missing.append(mid)
 
-            # 3. Low match rate -> the LLM hallucinated the IDs (common when
-            #    it was asked to "forward the latest N messages"). Fall back
-            #    to the latest N history messages as content nodes.
+            # 3. Resolve IDs missing from history one-by-one via get_msg.
+            #    This is the "point at what you mean" path: the LLM may have
+            #    referenced a message outside the recent window (e.g. a reply
+            #    target). get_msg works on NapCat (client DB) and SnowLuma
+            #    (message store); only truly unknown IDs are skipped.
+            for mid in missing:
+                msg = await self._fetch_msg(client, mid)
+                if msg is not None:
+                    matched += 1
+                    node = self._build_node(msg, str(mid))
+                    if node:
+                        nodes.append(node)
+                else:
+                    logger.warning(
+                        "[forward_fix] message_id %s not found via get_msg; skipped",
+                        mid,
+                    )
+
+            # 4. If most IDs could not be resolved, the LLM likely
+            #    hallucinated them. Fall back to the latest N history
+            #    messages as content nodes.
             if matched < len(message_ids) * 0.5:
                 logger.warning(
-                    "[forward_fix] only %d/%d message IDs matched history; "
+                    "[forward_fix] only %d/%d message IDs resolved; "
                     "falling back to latest %d messages",
                     matched, len(message_ids), len(message_ids),
                 )
@@ -252,7 +272,7 @@ class ForwardFixPlugin(BasePlugin):
                 logger.error("[forward_fix] no nodes to send")
                 return False
 
-            # 4. Send via the dedicated OneBot API.
+            # 5. Send via the dedicated OneBot API.
             if is_group:
                 result = await client.send_action(
                     "send_group_forward_msg",
@@ -311,6 +331,27 @@ class ForwardFixPlugin(BasePlugin):
             logger.error("[forward_fix] history fetch failed: %s", e)
         return []
 
+    async def _fetch_msg(self, client, message_id: int) -> dict | None:
+        """Fetch a single message by ID via get_msg (OneBot v11)."""
+        try:
+            resp = await client.send_action(
+                "get_msg", {"message_id": message_id}, timeout=15
+            )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                data = resp.get("data") or {}
+                if data.get("message"):
+                    return data
+        except Exception as e:
+            logger.error("[forward_fix] get_msg(%s) failed: %s", message_id, e)
+        return None
+
+    def _build_node(self, msg: dict, mid: str) -> dict | None:
+        """Build a node for a message: content node, or ID node for
+        structure-sensitive segments (file / nested forward / music)."""
+        if self._needs_id_node(msg):
+            return {"type": "node", "data": {"id": mid}}
+        return self._build_content_node(msg)
+
     @staticmethod
     def _needs_id_node(msg: dict) -> bool:
         """True if the message contains segments that need the original ID."""
@@ -321,20 +362,30 @@ class ForwardFixPlugin(BasePlugin):
 
     @staticmethod
     def _build_content_node(msg: dict) -> dict | None:
-        """Build a content node (user_id + time + content) from a history msg."""
+        """Build a content node (user_id + nickname + time + content) from a
+        history / get_msg message."""
         segs = msg.get("message") or []
         user_id = msg.get("user_id")
         if not segs or not user_id:
             return None
-        return {
-            "type": "node",
-            "data": {
-                # NapCat requires string user_id for forward nodes.
-                "user_id": str(user_id),
-                "time": int(msg.get("time") or 0),
-                "content": segs,
-            },
+        # Prefer the group card (card), then the nickname, so QQ shows the
+        # real name instead of falling back to the QQ number.
+        nickname = (
+            msg.get("card")
+            or msg.get("nickname")
+            or msg.get("sender", {}).get("card")
+            or msg.get("sender", {}).get("nickname")
+            or ""
+        )
+        data = {
+            # NapCat requires string user_id for forward nodes.
+            "user_id": str(user_id),
+            "time": int(msg.get("time") or 0),
+            "content": segs,
         }
+        if nickname:
+            data["nickname"] = str(nickname)
+        return {"type": "node", "data": data}
 
     async def _notify_failure(self, sid: str):
         """Optional user-visible failure notice (off by default)."""
