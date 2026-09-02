@@ -362,11 +362,15 @@ class ForwardFixPlugin(BasePlugin):
                 )
             if isinstance(resp, dict) and resp.get("status") == "ok":
                 messages = (resp.get("data") or {}).get("messages") or []
-                # Sort newest first by timestamp (some implementations return
-                # oldest first).
-                return sorted(
-                    messages, key=lambda m: m.get("time") or 0, reverse=True
-                )
+                # SnowLuma returns newest-first already; only re-sort when
+                # timestamps are present and meaningful (some implementations
+                # return time=0 for stored messages, which would scramble the
+                # order).
+                if messages and any(m.get("time") for m in messages):
+                    messages = sorted(
+                        messages, key=lambda m: m.get("time") or 0, reverse=True
+                    )
+                return messages
         except Exception as e:
             logger.error("[forward_fix] history fetch failed: %s", e)
         return []
@@ -414,6 +418,19 @@ class ForwardFixPlugin(BasePlugin):
         user_id = msg.get("user_id") or (msg.get("sender") or {}).get("user_id")
         if not segs or not user_id:
             return None
+        # Media segments without a usable source (file/url) would fail the
+        # whole forward on SnowLuma ("requires a file/url source"). Drop
+        # those segments; if nothing remains, the node cannot be built.
+        usable = []
+        for seg in segs:
+            stype = seg.get("type")
+            if stype in ("image", "record", "video"):
+                data = seg.get("data") or {}
+                if not (data.get("file") or data.get("url") or data.get("file_id")):
+                    continue
+            usable.append(seg)
+        if not usable:
+            return None
         # Prefer the group card (card), then the nickname, so QQ shows the
         # real name instead of falling back to the QQ number.
         sender = msg.get("sender") or {}
@@ -428,7 +445,7 @@ class ForwardFixPlugin(BasePlugin):
             # NapCat requires string user_id for forward nodes.
             "user_id": str(user_id),
             "time": int(msg.get("time") or 0),
-            "content": segs,
+            "content": usable,
         }
         if nickname:
             data["nickname"] = str(nickname)
