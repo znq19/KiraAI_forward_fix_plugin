@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 _GROUP_SESSION_TYPES = {"gm"}
 _PRIVATE_SESSION_TYPES = {"dm"}
 
+# Segment types that MUST keep the original message ID node because their
+# content cannot be rebuilt from history (file upload, nested forward,
+# music signature). Everything else - including reply - goes through a
+# content node (user_id + time + content), which needs no ID lookup at all.
+_ID_NODE_TYPES = {"file", "forward", "music"}
+
 
 class ForwardFixPlugin(BasePlugin):
     """
@@ -24,18 +30,32 @@ class ForwardFixPlugin(BasePlugin):
       merge case via send_group_segments -> send_action("send_group_msg", ...)
       with {"type": "node"} segments. OneBot rejects node segments outside a
       forward node list with retcode 1400.
-    - Fix: intercept at after_xml_parse, drop the Forward element, and call
-      the dedicated OneBot API send_group_forward_msg / send_private_forward_msg
-      directly, bypassing the built-in sender.
 
-    Design:
-    - Invisible to the LLM: no new tools, no prompt changes.
-    - Non-destructive: only touches the actions list for Forward elements.
-    - No impact on other plugins: high priority, only handles Forward types.
-    - Silent by default: no feedback text on success or failure (configurable).
-    - Group / private chat: decided by the sid session type (gm / dm).
-    - Real media forwarding: references original messages by ID, QQ client
-      pulls the full original content automatically.
+    Second failure mode (fixed in v1.2.0):
+    - Sending nodes by {"id": ...} requires the OneBot implementation to look
+      up each message's sender. NapCat resolves via the NTQQ client DB, but
+      SnowLuma / LLOneBot resolve via their own in-memory / SQLite message
+      store, which only contains messages seen since startup. IDs from the
+      HTTP history API (a different ID namespace) or from before a restart
+      are not found -> "has no valid sender user_id".
+
+    v1.3.0 strategy (content-node-first):
+    - Fetch real history via get_group_msg_history / get_friend_msg_history.
+    - Build content nodes (user_id + time + content) for ALL ordinary
+      messages, including reply segments - reply is a plain segment inside
+      content and needs no ID lookup.
+    - Only file / nested forward / music keep ID nodes (structure cannot be
+      rebuilt from content).
+    - If fewer than half the IDs match history, the LLM likely hallucinated
+      them - fall back to the latest N history messages.
+
+    v1.4.0 (precise resolution + nicknames):
+    - Content nodes now carry nickname (group card first, then nickname) so
+      QQ shows real names instead of QQ numbers.
+    - IDs not found in history are resolved one-by-one via get_msg(id)
+      instead of guessing: found -> build node from the fetched message;
+      not found -> skip that ID. Only when most IDs fail do we fall back to
+      the latest N history messages.
     """
 
     def __init__(self, ctx, cfg: dict):
@@ -185,12 +205,74 @@ class ForwardFixPlugin(BasePlugin):
                 logger.error("[forward_fix] adapter %r has no client", adapter_name)
                 return False
 
-            # Standard OneBot v11 node list; negative IDs are local message
-            # IDs and are valid here (the built-in sender failed because it
-            # sent node segments outside a forward node list, not because of
-            # the IDs themselves).
-            nodes = [{"type": "node", "data": {"id": str(mid)}} for mid in message_ids]
+            # 1. Fetch real history (read from the OneBot implementation's
+            #    local store, reliable).
+            fetch_count = max(len(message_ids) * 2, 20)
+            history = await self._fetch_history(
+                client, is_group, session_id, fetch_count
+            )
 
+            # 2. Match the LLM-provided IDs against history.
+            by_id = {}
+            for m in history:
+                mid = m.get("message_id")
+                if mid is not None:
+                    by_id[str(mid)] = m
+
+            nodes = []
+            matched = 0
+            missing = []
+            for mid in message_ids:
+                msg = by_id.get(str(mid))
+                if msg is not None:
+                    matched += 1
+                    node = self._build_node(msg, str(mid))
+                    if node:
+                        nodes.append(node)
+                else:
+                    missing.append(mid)
+
+            # 3. Resolve IDs missing from history one-by-one via get_msg.
+            #    This is the "point at what you mean" path: the LLM may have
+            #    referenced a message outside the recent window (e.g. a reply
+            #    target). get_msg works on NapCat (client DB) and SnowLuma
+            #    (message store); only truly unknown IDs are skipped.
+            for mid in missing:
+                msg = await self._fetch_msg(client, mid)
+                if msg is not None:
+                    matched += 1
+                    node = self._build_node(msg, str(mid))
+                    if node:
+                        nodes.append(node)
+                else:
+                    logger.warning(
+                        "[forward_fix] message_id %s not found via get_msg; skipped",
+                        mid,
+                    )
+
+            # 4. If most IDs could not be resolved, the LLM likely
+            #    hallucinated them. Fall back to the latest N history
+            #    messages as content nodes.
+            if matched < len(message_ids) * 0.5:
+                logger.warning(
+                    "[forward_fix] only %d/%d message IDs resolved; "
+                    "falling back to latest %d messages",
+                    matched, len(message_ids), len(message_ids),
+                )
+                nodes = []
+                for m in history[: len(message_ids)]:
+                    node = self._build_content_node(m)
+                    if node:
+                        nodes.append(node)
+                if not nodes:
+                    logger.error("[forward_fix] no usable history messages")
+                    return False
+
+            if not nodes:
+                logger.error("[forward_fix] no nodes to send")
+                return False
+
+            # 5. Send via the dedicated OneBot API.
             if is_group:
                 result = await client.send_action(
                     "send_group_forward_msg",
@@ -220,6 +302,90 @@ class ForwardFixPlugin(BasePlugin):
         except Exception as e:
             logger.error("[forward_fix] OneBot API raised: %s", e)
             return False
+
+    async def _fetch_history(
+        self, client, is_group: bool, session_id: str, count: int
+    ) -> list[dict]:
+        """Fetch recent message history via OneBot API (newest first)."""
+        try:
+            if is_group:
+                resp = await client.send_action(
+                    "get_group_msg_history",
+                    {"group_id": int(session_id), "count": count},
+                    timeout=15,
+                )
+            else:
+                resp = await client.send_action(
+                    "get_friend_msg_history",
+                    {"user_id": int(session_id), "count": count},
+                    timeout=15,
+                )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                messages = (resp.get("data") or {}).get("messages") or []
+                # Sort newest first by timestamp (some implementations return
+                # oldest first).
+                return sorted(
+                    messages, key=lambda m: m.get("time") or 0, reverse=True
+                )
+        except Exception as e:
+            logger.error("[forward_fix] history fetch failed: %s", e)
+        return []
+
+    async def _fetch_msg(self, client, message_id: int) -> dict | None:
+        """Fetch a single message by ID via get_msg (OneBot v11)."""
+        try:
+            resp = await client.send_action(
+                "get_msg", {"message_id": message_id}, timeout=15
+            )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                data = resp.get("data") or {}
+                if data.get("message"):
+                    return data
+        except Exception as e:
+            logger.error("[forward_fix] get_msg(%s) failed: %s", message_id, e)
+        return None
+
+    def _build_node(self, msg: dict, mid: str) -> dict | None:
+        """Build a node for a message: content node, or ID node for
+        structure-sensitive segments (file / nested forward / music)."""
+        if self._needs_id_node(msg):
+            return {"type": "node", "data": {"id": mid}}
+        return self._build_content_node(msg)
+
+    @staticmethod
+    def _needs_id_node(msg: dict) -> bool:
+        """True if the message contains segments that need the original ID."""
+        for seg in msg.get("message") or []:
+            if seg.get("type") in _ID_NODE_TYPES:
+                return True
+        return False
+
+    @staticmethod
+    def _build_content_node(msg: dict) -> dict | None:
+        """Build a content node (user_id + nickname + time + content) from a
+        history / get_msg message."""
+        segs = msg.get("message") or []
+        user_id = msg.get("user_id")
+        if not segs or not user_id:
+            return None
+        # Prefer the group card (card), then the nickname, so QQ shows the
+        # real name instead of falling back to the QQ number.
+        nickname = (
+            msg.get("card")
+            or msg.get("nickname")
+            or msg.get("sender", {}).get("card")
+            or msg.get("sender", {}).get("nickname")
+            or ""
+        )
+        data = {
+            # NapCat requires string user_id for forward nodes.
+            "user_id": str(user_id),
+            "time": int(msg.get("time") or 0),
+            "content": segs,
+        }
+        if nickname:
+            data["nickname"] = str(nickname)
+        return {"type": "node", "data": data}
 
     async def _notify_failure(self, sid: str):
         """Optional user-visible failure notice (off by default)."""
