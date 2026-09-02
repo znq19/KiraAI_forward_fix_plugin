@@ -21,7 +21,7 @@ retcode 1400: message segment "node" is only valid inside a forward node list
 - ✅ **对其他插件无影响**：高优先级执行，只匹配 Forward 类型
 - ✅ **完全静默**：默认成功/失败都不发提示文本（可配置）
 - ✅ **群聊 / 私聊都支持**：自动根据会话类型选择对应接口
-- ✅ **媒体真实转发**：普通消息（文本/图片/语音/视频/表情）走内容节点原样重发，不依赖消息 ID 缓存；文件/嵌套转发/引用/卡片/音乐保留真实 ID 节点，结构完整
+- ✅ **媒体真实转发**：所有普通消息（文本/图片/语音/视频/表情/引用）走内容节点原样重发，不依赖消息 ID 反查，兼容 NapCat / SnowLuma / LLOneBot；文件/嵌套转发/音乐卡片保留真实 ID 节点，结构完整
 - ✅ **防 LLM 幻觉 ID**：自动拉取真实历史匹配 ID，匹配率低时回退转发最近 N 条真实消息
 - ✅ **零配置**：装上即用，自动识别 QQ 平台
 
@@ -66,9 +66,9 @@ LLM 输出 <forward merge="true">id1,id2</forward>
 本插件在 after_xml_parse 阶段拦截：
   1. 从消息链中移除 Forward 元素
   2. 自动拉取真实历史（get_group_msg_history / get_friend_msg_history）
-  3. 匹配消息 ID，构造混合节点：
-     - 普通消息 → 内容节点（user_id + time + content）原样重发
-     - 文件/嵌套转发/引用/卡片/音乐 → 真实 ID 节点保留结构
+  3. 匹配消息 ID，构造内容节点：
+     - 普通消息（含引用回复）→ 内容节点（user_id + time + content）原样重发
+     - 文件/嵌套转发/音乐卡片 → 真实 ID 节点保留结构
   4. 直接调用 OneBot 专用接口：
      - 群聊 → send_group_forward_msg
      - 私聊 → send_private_forward_msg
@@ -76,7 +76,7 @@ LLM 输出 <forward merge="true">id1,id2</forward>
 OneBot 正常发送合并转发 ✅
 ```
 
-> **为什么不用纯 ID 节点？** NapCat 按 ID 引用消息时需要反查发送者，消息不在缓存（较旧/跨会话/ID 是 LLM 幻觉）就会报 `has no valid sender user_id`。内容节点自带发送者信息，不依赖反查，更可靠。
+> **为什么不用纯 ID 节点？** 按 ID 引用消息时，OneBot 实现需要反查发送者：NapCat 走 NTQQ 客户端数据库（能查到），但 SnowLuma / LLOneBot 只在自己的消息存储（仅含启动后收到的消息）中反查，历史接口返回的 ID 不在其中就会报 `has no valid sender user_id`。内容节点自带发送者信息，不依赖反查，跨实现可靠。
 
 ## 常见问题
 
@@ -95,6 +95,13 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 
 <details>
 <summary><b>更新日志</b></summary>
+
+### v1.3.0（2026-09-02）
+
+- **修复**：SnowLuma / LLOneBot 下合并转发仍报 `has no valid sender user_id`
+- **根因**：按消息 ID 引用节点时，SnowLuma / LLOneBot 在自己的消息存储（仅含启动后收到的消息）中反查发送者，历史接口返回的 ID 不在其中即失败；NapCat 走 NTQQ 客户端数据库所以正常
+- **方案**：内容节点优先——所有普通消息（含引用回复）一律构造完整内容节点（`user_id` + `time` + `content`）原样重发，完全不需要 ID 反查；仅文件/嵌套转发/音乐卡片保留 ID 节点
+- **兼容性**：内容节点是 OneBot v11 标准格式，NapCat / SnowLuma / LLOneBot 均支持
 
 ### v1.2.0（2026-09-02）
 

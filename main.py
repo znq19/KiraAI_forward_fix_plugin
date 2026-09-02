@@ -11,10 +11,11 @@ logger = logging.getLogger(__name__)
 _GROUP_SESSION_TYPES = {"gm"}
 _PRIVATE_SESSION_TYPES = {"dm"}
 
-# Segment types whose structure cannot be rebuilt from content (file upload,
-# nested forward, reply reference, card, music signature). These must keep
-# the original message ID node so NapCat preserves the structure.
-_ID_NODE_TYPES = {"file", "forward", "reply", "json", "music"}
+# Segment types that MUST keep the original message ID node because their
+# content cannot be rebuilt from history (file upload, nested forward,
+# music signature). Everything else - including reply - goes through a
+# content node (user_id + time + content), which needs no ID lookup at all.
+_ID_NODE_TYPES = {"file", "forward", "music"}
 
 
 class ForwardFixPlugin(BasePlugin):
@@ -31,14 +32,21 @@ class ForwardFixPlugin(BasePlugin):
       forward node list with retcode 1400.
 
     Second failure mode (fixed in v1.2.0):
-    - Sending nodes by {"id": ...} requires NapCat to look up each message's
-      sender; lookup fails with "has no valid sender user_id" when the ID is
-      not in NapCat's cache (stale / cross-session / hallucinated by the LLM).
-    - Fix: fetch the real message history via get_group_msg_history /
-      get_friend_msg_history, match IDs, and build content nodes
-      (user_id + time + content) for ordinary messages so no ID lookup is
-      needed. Special segments (file/forward/reply/card/music) keep ID nodes.
-      If fewer than half the IDs match history, the LLM likely hallucinated
+    - Sending nodes by {"id": ...} requires the OneBot implementation to look
+      up each message's sender. NapCat resolves via the NTQQ client DB, but
+      SnowLuma / LLOneBot resolve via their own in-memory / SQLite message
+      store, which only contains messages seen since startup. IDs from the
+      HTTP history API (a different ID namespace) or from before a restart
+      are not found -> "has no valid sender user_id".
+
+    v1.3.0 strategy (content-node-first):
+    - Fetch real history via get_group_msg_history / get_friend_msg_history.
+    - Build content nodes (user_id + time + content) for ALL ordinary
+      messages, including reply segments - reply is a plain segment inside
+      content and needs no ID lookup.
+    - Only file / nested forward / music keep ID nodes (structure cannot be
+      rebuilt from content).
+    - If fewer than half the IDs match history, the LLM likely hallucinated
       them - fall back to the latest N history messages.
     """
 
@@ -189,7 +197,8 @@ class ForwardFixPlugin(BasePlugin):
                 logger.error("[forward_fix] adapter %r has no client", adapter_name)
                 return False
 
-            # 1. Fetch real history (read from NapCat's local DB, reliable).
+            # 1. Fetch real history (read from the OneBot implementation's
+            #    local store, reliable).
             fetch_count = max(len(message_ids) * 2, 20)
             history = await self._fetch_history(
                 client, is_group, session_id, fetch_count
