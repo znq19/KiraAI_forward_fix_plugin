@@ -41,23 +41,21 @@ class ForwardFixPlugin(BasePlugin):
       HTTP history API (a different ID namespace) or from before a restart
       are not found -> "has no valid sender user_id".
 
-    v1.3.0 strategy (content-node-first):
-    - Fetch real history via get_group_msg_history / get_friend_msg_history.
-    - Build content nodes (user_id + time + content) for ALL ordinary
-      messages, including reply segments - reply is a plain segment inside
-      content and needs no ID lookup.
-    - Only file / nested forward / music keep ID nodes (structure cannot be
-      rebuilt from content).
+    v1.5.5 strategy (ID-node-first with content-node fallback):
+    - Resolve the LLM's IDs against real history (get_group_msg_history /
+      get_friend_msg_history) and get_msg, exactly like before.
+    - Send ID nodes FIRST ({type: node, data: {id}}). This matches the
+      built-in behavior: KiraAI without this plugin sends node segments
+      and NapCat resolves each ID from the NTQQ client DB, so images,
+      files and nested forwards all render natively. On NapCat / LLOneBot
+      the first send succeeds.
+    - If the ID-node send fails (SnowLuma / LLOneBot cannot look up the
+      sender), rebuild EVERYTHING as content nodes (user_id + nickname +
+      time + content; file/music segments dropped, reply segments rewritten
+      to the authoritative QQ seq, nested forwards expanded via
+      get_forward_msg) and retry once.
     - If fewer than half the IDs match history, the LLM likely hallucinated
-      them - fall back to the latest N history messages.
-
-    v1.4.0 (precise resolution + nicknames):
-    - Content nodes now carry nickname (group card first, then nickname) so
-      QQ shows real names instead of QQ numbers.
-    - IDs not found in history are resolved one-by-one via get_msg(id)
-      instead of guessing: found -> build node from the fetched message;
-      not found -> skip that ID. Only when most IDs fail do we fall back to
-      the latest N history messages.
+      them - fall back to the latest N history messages (real IDs).
     """
 
     def __init__(self, ctx, cfg: dict):
@@ -221,22 +219,14 @@ class ForwardFixPlugin(BasePlugin):
                 if mid is not None:
                     by_id[str(mid)] = m
 
-            nodes = []
+            resolved = []  # (mid, msg) pairs, in the LLM's order
             matched = 0
             missing = []
             for mid in message_ids:
                 msg = by_id.get(str(mid))
                 if msg is not None:
-                    node = await self._build_node(client, msg, str(mid))
-                    if node:
-                        matched += 1
-                        nodes.append(node)
-                    else:
-                        logger.warning(
-                            "[forward_fix] message_id %s matched history but "
-                            "could not build a node; skipped",
-                            mid,
-                        )
+                    resolved.append((str(mid), msg))
+                    matched += 1
                 else:
                     missing.append(mid)
 
@@ -248,10 +238,8 @@ class ForwardFixPlugin(BasePlugin):
             for mid in missing:
                 msg = await self._fetch_msg(client, mid)
                 if msg is not None:
-                    node = await self._build_node(client, msg, str(mid))
-                    if node:
-                        matched += 1
-                        nodes.append(node)
+                    resolved.append((str(mid), msg))
+                    matched += 1
                 else:
                     logger.warning(
                         "[forward_fix] message_id %s not found via get_msg; skipped",
@@ -260,75 +248,75 @@ class ForwardFixPlugin(BasePlugin):
 
             # 4. If most IDs could not be resolved, the LLM likely
             #    hallucinated them. Fall back to the latest N history
-            #    messages as content nodes.
+            #    messages (real IDs, resolvable by every implementation).
             if matched < len(message_ids) * 0.5:
                 logger.warning(
                     "[forward_fix] only %d/%d message IDs resolved; "
                     "falling back to latest %d messages",
                     matched, len(message_ids), len(message_ids),
                 )
-                nodes = []
+                resolved = []
                 for m in history[: len(message_ids)]:
-                    if self._needs_id_node(m):
-                        # file / music messages keep the ID node so NapCat
-                        # can resolve the real file; content nodes cannot
-                        # rebuild them.
-                        mid = m.get("message_id")
-                        if mid is not None:
-                            nodes.append({"type": "node", "data": {"id": mid}})
-                        continue
-                    node = await self._build_content_node(client, m)
-                    if node:
-                        nodes.append(node)
-                if not nodes:
+                    mid = m.get("message_id")
+                    if mid is not None:
+                        resolved.append((str(mid), m))
+                if not resolved:
                     logger.error("[forward_fix] no usable history messages")
                     return False
 
-            if not nodes:
-                logger.error("[forward_fix] no nodes to send")
-                return False
-
-            # 5. Send via the dedicated OneBot API. If the send fails and the
-            #    node list contains ID nodes (file / music), retry once
-            #    without them - an unresolvable ID node fails the whole
-            #    forward on SnowLuma / LLOneBot, and dropping it lets the
-            #    remaining content nodes go through.
-            result = await self._send_nodes(client, is_group, session_id, nodes)
+            # 5. ID nodes FIRST - this matches the built-in behavior
+            #    (KiraAI without this plugin sends node segments and NapCat
+            #    resolves each ID from the NTQQ client DB, so images, files
+            #    and nested forwards all render natively). On NapCat /
+            #    LLOneBot this succeeds on the first try; on SnowLuma the
+            #    ID lookup fails and we fall back to content nodes below.
+            id_nodes = [
+                {"type": "node", "data": {"id": int(mid)}}
+                for mid, _ in resolved
+            ]
+            result = await self._send_nodes(client, is_group, session_id, id_nodes)
             if result is True:
                 return True
-            if result is False and any(
-                n.get("data", {}).get("id") for n in nodes
-            ):
-                content_only = [
-                    n for n in nodes if not n.get("data", {}).get("id")
-                ]
-                if content_only:
-                    logger.warning(
-                        "[forward_fix] ID-node send failed; retrying with "
-                        "%d content nodes only",
-                        len(content_only),
-                    )
-                    result = await self._send_nodes(
-                        client, is_group, session_id, content_only
-                    )
-                    if result is True:
-                        return True
-            # 6. Fuse: if the send still failed and any content node carries a
-            #    native reply segment (probe said renderable but the
+
+            # 6. Fallback: rebuild everything as content nodes (file/music
+            #    segments dropped, reply segments rewritten to the
+            #    authoritative QQ seq, nested forwards expanded) and retry
+            #    once. This is the SnowLuma / LLOneBot path.
+            logger.warning(
+                "[forward_fix] ID-node send failed; retrying with %d "
+                "content nodes",
+                len(resolved),
+            )
+            content_nodes = []
+            for mid, msg in resolved:
+                node = await self._build_node(
+                    client, msg, mid, force_content=True
+                )
+                if node:
+                    content_nodes.append(node)
+            if not content_nodes:
+                logger.error("[forward_fix] no content nodes to send")
+                return False
+            result = await self._send_nodes(
+                client, is_group, session_id, content_nodes
+            )
+            if result is True:
+                return True
+
+            # 7. Fuse: if the send still failed and any content node carries
+            #    a native reply segment (probe said renderable but the
             #    implementation rejected it), drop those nodes entirely and
             #    retry once - every forwarded message stays real (native
             #    quotes only), and the rest still goes through.
-            if result is False and any(
-                self._node_has_reply(n) for n in nodes
-            ):
+            if any(self._node_has_reply(n) for n in content_nodes):
                 no_reply = [
-                    n for n in nodes if not self._node_has_reply(n)
+                    n for n in content_nodes if not self._node_has_reply(n)
                 ]
                 if no_reply:
                     logger.warning(
                         "[forward_fix] reply-segment send failed; retrying "
                         "without %d reply-carrying nodes",
-                        len(nodes) - len(no_reply),
+                        len(content_nodes) - len(no_reply),
                     )
                     result = await self._send_nodes(
                         client, is_group, session_id, no_reply
@@ -429,9 +417,15 @@ class ForwardFixPlugin(BasePlugin):
             logger.error("[forward_fix] get_msg(%s) failed: %s", message_id, e)
         return None
 
-    async def _build_node(self, client, msg: dict, mid: str) -> dict | None:
+    async def _build_node(
+        self, client, msg: dict, mid: str, force_content: bool = False
+    ) -> dict | None:
         """Build a node for a message: content node, or ID node for
         structure-sensitive segments (file / music).
+        With force_content=True (the fallback path after an ID-node send
+        failed), file / music messages are rebuilt as content nodes with
+        those segments dropped - an ID node would fail again for the same
+        reason the first send failed.
         Nested forward segments are EXPANDED via get_forward_msg into
         nested content nodes - SnowLuma's uploadRecursive and NapCat's
         uploadForwardedNodesPacket both recognize nested node arrays and
@@ -455,7 +449,7 @@ class ForwardFixPlugin(BasePlugin):
         user_id / empty content / unresolvable reply) - the caller skips
         it instead of falling back to an ID node, because an unresolvable
         ID node fails the whole forward on SnowLuma / LLOneBot."""
-        if self._needs_id_node(msg):
+        if not force_content and self._needs_id_node(msg):
             return {"type": "node", "data": {"id": mid}}
         # Probe reply targets: {reply_id: authoritative_qq_seq}.
         reply_seqs = {}
@@ -521,14 +515,14 @@ class ForwardFixPlugin(BasePlugin):
                 if not (data.get("file") or data.get("url") or data.get("file_id")):
                     continue
             elif stype in ("file", "music"):
-                # File / music segments: keep ONLY when a usable source
-                # exists (url/file/file_id) so NapCat can download and
-                # forward the real file. A source-less file segment makes
-                # NapCat's handleOb11FileLikeMessage throw "element not
-                # found" and fail the WHOLE forward - drop those.
-                data = seg.get("data") or {}
-                if not (data.get("file") or data.get("url") or data.get("file_id")):
-                    continue
+                # File / music segments are ALWAYS dropped from content
+                # nodes. NapCat's handleOb11FileLikeMessage tries to
+                # download data.url - history URLs are usually expired, the
+                # download fails with "element not found" and fails the
+                # WHOLE forward. Outer file messages keep the ID node
+                # instead (NapCat resolves the real file from the client
+                # DB - true file forwarding without URL downloads).
+                continue
             elif stype == "reply":
                 rid = (seg.get("data") or {}).get("id", "")
                 seq = (reply_seqs or {}).get(str(rid))
