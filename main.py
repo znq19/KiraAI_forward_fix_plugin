@@ -51,9 +51,10 @@ class ForwardFixPlugin(BasePlugin):
       the first send succeeds.
     - If the ID-node send fails (SnowLuma / LLOneBot cannot look up the
       sender), rebuild EVERYTHING as content nodes (user_id + nickname +
-      time + content; file/music segments dropped, reply segments rewritten
-      to the authoritative QQ seq, nested forwards expanded via
-      get_forward_msg) and retry once.
+      time + content; file/music segments dropped, reply segments keep
+      their ORIGINAL message_id - every implementation resolves the real
+      quote from it, nested forwards expanded via get_forward_msg) and
+      retry once.
     - If fewer than half the IDs match history, the LLM likely hallucinated
       them - fall back to the latest N history messages (real IDs).
     """
@@ -432,48 +433,44 @@ class ForwardFixPlugin(BasePlugin):
         render real multi-level forward cards. (Keeping {type: forward,
         data: {id: message_id}} would point at a non-existent res_id and
         render an empty card - the "点进去是空的" bug.)
-        Reply segments are probed via get_msg: the quoted message's QQ
-        authoritative sequence (message_seq) is written into the reply
-        segment as BOTH id and seq, so every implementation renders the
-        REAL quote bubble:
-          - SnowLuma: reply codec reads data.id; a positive id is used
-            directly as the QQ sequence (backward-compatible path).
-          - NapCat: reply converter prefers data.seq -> looks the message
-            up by sequence -> full quote with content and time.
-          - LLOneBot: standard OneBot reply segment, id=seq is compatible.
-        Messages whose quoted message cannot be resolved (get_msg fails or
-        no message_seq) are SKIPPED entirely - never textified, never sent
-        with a broken reply - so every forwarded message is real and the
-        send succeeds.
+        Reply segments keep the ORIGINAL message_id - NO seq rewrite.
+        (v1.5.2 rewrote {id: seq, seq: seq} from get_msg's message_seq,
+        but NapCat's get_msg OVERWRITES message_seq with the short-hash
+        message_id - it is NOT the QQ authoritative sequence. Sending
+        that fake seq made NapCat's seq-first lookup fetch the WRONG
+        message (引用错位), and SnowLuma's resolveReplySequence(messageId)
+        failed the store lookup and fell back to a broken seq (旧版抛
+        "missing required or usable fields").)
+        Every implementation resolves the reply from the ORIGINAL id:
+          - NapCat: id branch -> getMsgIdAndPeerByShortId -> real message
+          - SnowLuma: resolveReplySequence(id) -> store lookup -> real seq
+          - LLOneBot: standard OneBot reply, id compatible.
+        Probe: get_msg must resolve the quoted message (same store the
+        implementation uses for reply lookup - get_msg works ⇔ the reply
+        renders). Unresolvable replies have their segment DROPPED while
+        the rest of the message is kept - never textified, never sent
+        with a broken reply, never dropped entirely.
         Returns None when the message cannot be represented (missing
-        user_id / empty content / unresolvable reply) - the caller skips
-        it instead of falling back to an ID node, because an unresolvable
-        ID node fails the whole forward on SnowLuma / LLOneBot."""
+        user_id / empty content) - the caller skips it instead of
+        falling back to an ID node, because an unresolvable ID node fails
+        the whole forward on SnowLuma / LLOneBot."""
         if not force_content and self._needs_id_node(msg):
             return {"type": "node", "data": {"id": mid}}
-        # Probe reply targets: {reply_id: authoritative_qq_seq}.
-        reply_seqs = {}
+        # Probe reply targets: the set of reply ids that get_msg can
+        # resolve (and therefore every implementation can render).
+        resolvable = set()
         for seg in msg.get("message") or []:
             if seg.get("type") == "reply":
                 rid = (seg.get("data") or {}).get("id", "")
                 if not rid:
-                    return None
+                    continue
                 try:
                     quoted = await self._fetch_msg(client, int(rid))
-                    seq = (quoted or {}).get("message_seq") or 0
-                    if quoted is None or not seq or seq <= 0:
-                        # Cannot render a real quote - skip the whole
-                        # message rather than textify or send a broken reply.
-                        logger.warning(
-                            "[forward_fix] reply target %s has no "
-                            "authoritative seq; skipping message %s",
-                            rid, mid,
-                        )
-                        return None
-                    reply_seqs[str(rid)] = int(seq)
+                    if quoted is not None and quoted.get("message"):
+                        resolvable.add(str(rid))
                 except (TypeError, ValueError):
-                    return None
-        return await self._build_content_node(client, msg, reply_seqs)
+                    continue
+        return await self._build_content_node(client, msg, resolvable)
 
     @staticmethod
     def _needs_id_node(msg: dict) -> bool:
@@ -484,14 +481,15 @@ class ForwardFixPlugin(BasePlugin):
         return False
 
     async def _build_content_node(
-        self, client, msg: dict, reply_seqs: dict | None = None, depth: int = 0
+        self, client, msg: dict, resolvable_replies: set | None = None, depth: int = 0
     ) -> dict | None:
         """Build a content node (user_id + nickname + time + content) from a
-        history / get_msg message. Reply segments whose quoted message was
-        probed (in `reply_seqs`, mapping reply_id -> authoritative QQ seq)
-        are rewritten to {id: seq, seq: seq} so every implementation renders
-        the real quote bubble (SnowLuma: id-as-seq; NapCat: seq lookup;
-        LLOneBot: standard). Nested forward segments are expanded via
+        history / get_msg message. Reply segments keep their ORIGINAL
+        message_id (in `resolvable_replies`, the set of reply ids that
+        get_msg resolved) - every implementation resolves the quote from
+        that id (NapCat: short-id lookup; SnowLuma: store lookup; LLOneBot:
+        standard). Unresolvable reply segments are DROPPED while the rest
+        of the message is kept. Nested forward segments are expanded via
         get_forward_msg into nested content nodes (real multi-level cards).
         time is ALWAYS provided (msg.time or now) - omitting it renders
         1970 on older SnowLuma builds."""
@@ -525,16 +523,15 @@ class ForwardFixPlugin(BasePlugin):
                 continue
             elif stype == "reply":
                 rid = (seg.get("data") or {}).get("id", "")
-                seq = (reply_seqs or {}).get(str(rid))
-                if seq:
-                    # Rewrite to the authoritative QQ sequence: SnowLuma
-                    # renders id-as-seq, NapCat prefers seq lookup.
-                    usable.append(
-                        {"type": "reply", "data": {"id": str(seq), "seq": str(seq)}}
-                    )
+                if rid and str(rid) in (resolvable_replies or set()):
+                    # Keep the ORIGINAL message_id - every implementation
+                    # resolves the real quote from it (NapCat short-id
+                    # lookup, SnowLuma store lookup, LLOneBot standard).
+                    usable.append({"type": "reply", "data": {"id": str(rid)}})
                 else:
-                    # Defensive: no probed seq - drop the reply segment
-                    # (the message itself was already skipped upstream).
+                    # Unresolvable reply: drop the segment, keep the rest
+                    # of the message (never textify, never drop the whole
+                    # message, never send a broken reply).
                     continue
                 continue
             elif stype == "forward":

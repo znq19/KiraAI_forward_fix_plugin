@@ -102,6 +102,12 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 <details>
 <summary><b>更新日志</b></summary>
 
+### v1.5.6（2026-09-03）
+
+- **修复引用错位 + SnowLuma reply 报错（根因实锤）**：v1.5.2 起把 reply 段改写为 `{id: seq, seq: seq}`（seq=探测的 `message_seq`），但 **NapCat 的 `get_msg` 把 `message_seq` 覆盖成短哈希 message_id**（`action/msg/GetMsg.ts`：`retMsg.message_seq = retMsg.message_id`）——它不是 QQ 权威 seq！NapCat 发送侧 `seq` 分支用假 seq 查 `getMsgsBySeqAndCount` → **查到错误消息 → 引用错位**；SnowLuma 的 `resolveReplySequence(messageId)` 用 message_id 反查 store，传 seq 进去反查失败 → 旧版抛 `message segment "reply" is missing required or usable fields`
+- **修复**：reply 段**保留原始 message_id，不再改写 seq**——NapCat 走 `id` 分支 `getMsgIdAndPeerByShortId` 反查真实消息、SnowLuma 走 `resolveReplySequence(id)` 反查 store、LLOneBot 标准兼容（这就是 LLOneBot 引用完全真实的原因）
+- **不丢弃**：不可解析的 reply 段**剔除段、保留消息其余内容**（不再整条跳过）；探测闭环不变（get_msg 能查到 ⇔ reply 能渲染，同一消息存储）
+
 ### v1.5.5（2026-09-03）
 
 - **策略反转：ID 节点优先 + 内容节点回退**（分流）——之前"内容节点优先"反而破坏了 NapCat 的原生能力（不装插件时 KiraAI 直接发 node 段，NapCat 从客户端数据库反查，图片/文件/嵌套全真实）。现在：**先发 ID 节点**（NapCat/LLOneBot 第一次就成功，与不装插件行为完全一致）；**失败自动回退内容节点**（SnowLuma 路径：file/music 段剔除、reply 改写权威 seq、嵌套 forward 展开）；回退仍失败再剔除 reply 节点重试
