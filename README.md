@@ -102,9 +102,14 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 <details>
 <summary><b>更新日志</b></summary>
 
+### v1.5.5（2026-09-03）
+
+- **策略反转：ID 节点优先 + 内容节点回退**（分流）——之前"内容节点优先"反而破坏了 NapCat 的原生能力（不装插件时 KiraAI 直接发 node 段，NapCat 从客户端数据库反查，图片/文件/嵌套全真实）。现在：**先发 ID 节点**（NapCat/LLOneBot 第一次就成功，与不装插件行为完全一致）；**失败自动回退内容节点**（SnowLuma 路径：file/music 段剔除、reply 改写权威 seq、嵌套 forward 展开）；回退仍失败再剔除 reply 节点重试
+- **回退路径强制内容节点**：`_build_node` 加 `force_content` 参数——ID 节点发送已失败时，file/music 消息也重建为内容节点（段剔除、文本保留），不再放回 ID 节点（会因同样原因再挂）
+
 ### v1.5.4（2026-09-03）
 
-- **修复**：NapCat 下转发整体失败（`retcode 1200: element not found`）——嵌套转发展开的内层消息若含**无源 file/music 段**，NapCat 的 `handleOb11FileLikeMessage` 抛错并**拖垮整个转发**。修复：内容节点构建时**有源（url/file/file_id）的 file 段保留（真实转发文件），无源剔除**；外层 file 消息仍走 ID 节点，回退路径同步处理
+- **修复**：NapCat 下转发整体失败（`retcode 1200: element not found`，栈 `handleOb11FileLikeMessage` → `at async file`）——内容节点里的 **file 段** NapCat 会尝试下载 `data.url`，历史消息的 url 通常已过期 → 下载失败 → **拖垮整个转发**。修复：内容节点构建时 **file/music 段一律剔除**（外层 file 消息走 ID 节点，NapCat 从客户端数据库反查真实文件，不依赖 url 下载）；image/record/video 有源保留（NapCat 实测正常）
 - **规范**：manifest 补 `repo` 字段
 
 ### v1.5.3（2026-09-03）
