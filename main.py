@@ -225,10 +225,16 @@ class ForwardFixPlugin(BasePlugin):
             for mid in message_ids:
                 msg = by_id.get(str(mid))
                 if msg is not None:
-                    matched += 1
                     node = self._build_node(msg, str(mid))
                     if node:
+                        matched += 1
                         nodes.append(node)
+                    else:
+                        logger.warning(
+                            "[forward_fix] message_id %s matched history but "
+                            "could not build a node; skipped",
+                            mid,
+                        )
                 else:
                     missing.append(mid)
 
@@ -240,9 +246,9 @@ class ForwardFixPlugin(BasePlugin):
             for mid in missing:
                 msg = await self._fetch_msg(client, mid)
                 if msg is not None:
-                    matched += 1
                     node = self._build_node(msg, str(mid))
                     if node:
+                        matched += 1
                         nodes.append(node)
                 else:
                     logger.warning(
@@ -272,7 +278,42 @@ class ForwardFixPlugin(BasePlugin):
                 logger.error("[forward_fix] no nodes to send")
                 return False
 
-            # 5. Send via the dedicated OneBot API.
+            # 5. Send via the dedicated OneBot API. If the send fails and the
+            #    node list contains ID nodes (file / nested forward / music),
+            #    retry once without them - an unresolvable ID node fails the
+            #    whole forward on SnowLuma / LLOneBot, and dropping it lets
+            #    the remaining content nodes go through.
+            result = await self._send_nodes(client, is_group, session_id, nodes)
+            if result is True:
+                return True
+            if result is False and any(
+                n.get("data", {}).get("id") for n in nodes
+            ):
+                content_only = [
+                    n for n in nodes if not n.get("data", {}).get("id")
+                ]
+                if content_only:
+                    logger.warning(
+                        "[forward_fix] ID-node send failed; retrying with "
+                        "%d content nodes only",
+                        len(content_only),
+                    )
+                    result = await self._send_nodes(
+                        client, is_group, session_id, content_only
+                    )
+                    if result is True:
+                        return True
+            return False
+
+        except Exception as e:
+            logger.error("[forward_fix] OneBot API raised: %s", e)
+            return False
+
+    async def _send_nodes(
+        self, client, is_group: bool, session_id: str, nodes: list[dict]
+    ) -> bool:
+        """Send a node list via the dedicated OneBot API."""
+        try:
             if is_group:
                 result = await client.send_action(
                     "send_group_forward_msg",
@@ -298,7 +339,6 @@ class ForwardFixPlugin(BasePlugin):
                 return False
             # Some implementations return None / truthy on success.
             return result is None or bool(result)
-
         except Exception as e:
             logger.error("[forward_fix] OneBot API raised: %s", e)
             return False
@@ -347,18 +387,14 @@ class ForwardFixPlugin(BasePlugin):
 
     def _build_node(self, msg: dict, mid: str) -> dict | None:
         """Build a node for a message: content node, or ID node for
-        structure-sensitive segments (file / nested forward / music), or
-        ID node as a fallback when the content node cannot be built
-        (missing user_id / empty content in some implementations)."""
+        structure-sensitive segments (file / nested forward / music).
+        Returns None when the message cannot be represented (missing
+        user_id / empty content) - the caller skips it instead of
+        falling back to an ID node, because an unresolvable ID node
+        fails the whole forward on SnowLuma / LLOneBot."""
         if self._needs_id_node(msg):
             return {"type": "node", "data": {"id": mid}}
-        node = self._build_content_node(msg)
-        if node is not None:
-            return node
-        # Content node not buildable - fall back to the ID node so the
-        # message is still forwarded (works when the implementation can
-        # resolve the ID, e.g. SnowLuma message store / NapCat client DB).
-        return {"type": "node", "data": {"id": mid}}
+        return self._build_content_node(msg)
 
     @staticmethod
     def _needs_id_node(msg: dict) -> bool:
