@@ -12,10 +12,11 @@ _GROUP_SESSION_TYPES = {"gm"}
 _PRIVATE_SESSION_TYPES = {"dm"}
 
 # Segment types that MUST keep the original message ID node because their
-# content cannot be rebuilt from history (file upload, nested forward,
-# music signature). Everything else - including reply - goes through a
-# content node (user_id + time + content), which needs no ID lookup at all.
-_ID_NODE_TYPES = {"file", "forward", "music"}
+# content cannot be rebuilt (file upload, music signature). Nested forward
+# is expanded via get_forward_msg into content nodes (multi-level forward);
+# reply segments are textified to [引用 msg_id:xxx] so rendering does not
+# depend on the implementation's reply lookup.
+_ID_NODE_TYPES = {"file", "music"}
 
 
 class ForwardFixPlugin(BasePlugin):
@@ -225,7 +226,7 @@ class ForwardFixPlugin(BasePlugin):
             for mid in message_ids:
                 msg = by_id.get(str(mid))
                 if msg is not None:
-                    node = self._build_node(msg, str(mid))
+                    node = await self._build_node(client, msg, str(mid))
                     if node:
                         matched += 1
                         nodes.append(node)
@@ -246,7 +247,7 @@ class ForwardFixPlugin(BasePlugin):
             for mid in missing:
                 msg = await self._fetch_msg(client, mid)
                 if msg is not None:
-                    node = self._build_node(msg, str(mid))
+                    node = await self._build_node(client, msg, str(mid))
                     if node:
                         matched += 1
                         nodes.append(node)
@@ -389,16 +390,35 @@ class ForwardFixPlugin(BasePlugin):
             logger.error("[forward_fix] get_msg(%s) failed: %s", message_id, e)
         return None
 
-    def _build_node(self, msg: dict, mid: str) -> dict | None:
+    async def _build_node(self, client, msg: dict, mid: str) -> dict | None:
         """Build a node for a message: content node, or ID node for
-        structure-sensitive segments (file / nested forward / music).
+        structure-sensitive segments (file / music). Nested forward
+        segments stay inside the content node as {type: forward, data:
+        {id}} - both NapCat and SnowLuma render them as nested forward
+        cards (multi-level forward).
+        Reply segments are probed via get_msg: when the quoted message
+        resolves, the native reply segment is kept (QQ renders the real
+        quote bubble with correct content and time); otherwise it is
+        textified to [引用 msg_id:xxx] so the display is never wrong.
         Returns None when the message cannot be represented (missing
         user_id / empty content) - the caller skips it instead of
         falling back to an ID node, because an unresolvable ID node
         fails the whole forward on SnowLuma / LLOneBot."""
         if self._needs_id_node(msg):
             return {"type": "node", "data": {"id": mid}}
-        return self._build_content_node(msg)
+        # Probe reply targets: get_msg resolvable <=> the implementation can
+        # render the native reply (same message store on SnowLuma).
+        resolvable = set()
+        for seg in msg.get("message") or []:
+            if seg.get("type") == "reply":
+                rid = (seg.get("data") or {}).get("id", "")
+                if rid:
+                    try:
+                        if await self._fetch_msg(client, int(rid)) is not None:
+                            resolvable.add(str(rid))
+                    except (TypeError, ValueError):
+                        pass
+        return self._build_content_node(msg, resolvable)
 
     @staticmethod
     def _needs_id_node(msg: dict) -> bool:
@@ -409,9 +429,11 @@ class ForwardFixPlugin(BasePlugin):
         return False
 
     @staticmethod
-    def _build_content_node(msg: dict) -> dict | None:
+    def _build_content_node(msg: dict, resolvable_replies: set | None = None) -> dict | None:
         """Build a content node (user_id + nickname + time + content) from a
-        history / get_msg message."""
+        history / get_msg message. Reply segments whose quoted message is in
+        `resolvable_replies` keep the native reply segment (real quote
+        bubble); others are textified to [引用 msg_id:xxx]."""
         segs = msg.get("message") or []
         # Some implementations (e.g. SnowLuma) nest the sender under
         # `sender.user_id` instead of a top-level `user_id`.
@@ -428,6 +450,19 @@ class ForwardFixPlugin(BasePlugin):
                 data = seg.get("data") or {}
                 if not (data.get("file") or data.get("url") or data.get("file_id")):
                     continue
+            elif stype == "reply":
+                rid = (seg.get("data") or {}).get("id", "")
+                if resolvable_replies and str(rid) in resolvable_replies:
+                    # The implementation can resolve the quoted message -
+                    # keep the native reply segment so QQ renders the real
+                    # quote bubble (correct content and time).
+                    usable.append(seg)
+                else:
+                    # Cannot resolve: textify so the display is never wrong.
+                    usable.append(
+                        {"type": "text", "data": {"text": f"[引用 msg_id:{rid}]"}}
+                    )
+                continue
             usable.append(seg)
         if not usable:
             return None
@@ -444,9 +479,13 @@ class ForwardFixPlugin(BasePlugin):
         data = {
             # NapCat requires string user_id for forward nodes.
             "user_id": str(user_id),
-            "time": int(msg.get("time") or 0),
             "content": usable,
         }
+        # Only include time when it is meaningful; time=0 (SnowLuma stored
+        # messages) would render as 1970 in the forward card.
+        msg_time = int(msg.get("time") or 0)
+        if msg_time > 0:
+            data["time"] = msg_time
         if nickname:
             data["nickname"] = str(nickname)
         return {"type": "node", "data": data}
