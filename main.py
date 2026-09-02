@@ -1,4 +1,5 @@
 import logging
+import time
 from core.plugin import BasePlugin, on, Priority
 from core.chat import MessageChain
 from core.chat.message_elements import Forward, Text
@@ -268,7 +269,7 @@ class ForwardFixPlugin(BasePlugin):
                 )
                 nodes = []
                 for m in history[: len(message_ids)]:
-                    node = self._build_content_node(m)
+                    node = await self._build_content_node(client, m)
                     if node:
                         nodes.append(node)
                 if not nodes:
@@ -422,21 +423,21 @@ class ForwardFixPlugin(BasePlugin):
 
     async def _build_node(self, client, msg: dict, mid: str) -> dict | None:
         """Build a node for a message: content node, or ID node for
-        structure-sensitive segments (file / music). Nested forward
-        segments stay inside the content node as {type: forward, data:
-        {id}} - both NapCat and SnowLuma render them as nested forward
-        cards (multi-level forward).
+        structure-sensitive segments (file / music).
+        Nested forward segments are EXPANDED via get_forward_msg into
+        nested content nodes - SnowLuma's uploadRecursive and NapCat's
+        uploadForwardedNodesPacket both recognize nested node arrays and
+        render real multi-level forward cards. (Keeping {type: forward,
+        data: {id: message_id}} would point at a non-existent res_id and
+        render an empty card - the "点进去是空的" bug.)
         Reply segments are probed via get_msg: the quoted message's QQ
-        authoritative sequence (message_seq) is extracted and written into
-        the reply segment as BOTH id and seq, so every implementation
-        renders the REAL quote bubble:
+        authoritative sequence (message_seq) is written into the reply
+        segment as BOTH id and seq, so every implementation renders the
+        REAL quote bubble:
           - SnowLuma: reply codec reads data.id; a positive id is used
-            directly as the QQ sequence (backward-compatible path) ->
-            real quote. (A negative message_id hash would return null and
-            fail the whole forward on older SnowLuma builds - this is the
-            retcode 1400 root cause.)
+            directly as the QQ sequence (backward-compatible path).
           - NapCat: reply converter prefers data.seq -> looks the message
-            up by sequence -> real quote.
+            up by sequence -> full quote with content and time.
           - LLOneBot: standard OneBot reply segment, id=seq is compatible.
         Messages whose quoted message cannot be resolved (get_msg fails or
         no message_seq) are SKIPPED entirely - never textified, never sent
@@ -470,7 +471,7 @@ class ForwardFixPlugin(BasePlugin):
                     reply_seqs[str(rid)] = int(seq)
                 except (TypeError, ValueError):
                     return None
-        return self._build_content_node(msg, reply_seqs)
+        return await self._build_content_node(client, msg, reply_seqs)
 
     @staticmethod
     def _needs_id_node(msg: dict) -> bool:
@@ -480,15 +481,20 @@ class ForwardFixPlugin(BasePlugin):
                 return True
         return False
 
-    @staticmethod
-    def _build_content_node(msg: dict, reply_seqs: dict | None = None) -> dict | None:
+    async def _build_content_node(
+        self, client, msg: dict, reply_seqs: dict | None = None, depth: int = 0
+    ) -> dict | None:
         """Build a content node (user_id + nickname + time + content) from a
         history / get_msg message. Reply segments whose quoted message was
         probed (in `reply_seqs`, mapping reply_id -> authoritative QQ seq)
         are rewritten to {id: seq, seq: seq} so every implementation renders
         the real quote bubble (SnowLuma: id-as-seq; NapCat: seq lookup;
-        LLOneBot: standard). A reply without a probed seq means the whole
-        message was already skipped upstream - this is a defensive guard."""
+        LLOneBot: standard). Nested forward segments are expanded via
+        get_forward_msg into nested content nodes (real multi-level cards).
+        time is ALWAYS provided (msg.time or now) - omitting it renders
+        1970 on older SnowLuma builds."""
+        if depth > 3:
+            return None
         segs = msg.get("message") or []
         # Some implementations (e.g. SnowLuma) nest the sender under
         # `sender.user_id` instead of a top-level `user_id`.
@@ -499,6 +505,7 @@ class ForwardFixPlugin(BasePlugin):
         # whole forward on SnowLuma ("requires a file/url source"). Drop
         # those segments; if nothing remains, the node cannot be built.
         usable = []
+        nested_nodes = None
         for seg in segs:
             stype = seg.get("type")
             if stype in ("image", "record", "video"):
@@ -519,8 +526,29 @@ class ForwardFixPlugin(BasePlugin):
                     # (the message itself was already skipped upstream).
                     continue
                 continue
+            elif stype == "forward":
+                # Expand the nested forward via get_forward_msg: the stored
+                # data.id is the res_id (receive-side codec), so pass it
+                # through. The expanded nodes become the ENTIRE content as a
+                # pure node array - SnowLuma's isNestedNodeArray requires
+                # content to be all-node, and QQ never mixes a forward card
+                # with other segments in one message.
+                fid = (seg.get("data") or {}).get("id", "")
+                if fid:
+                    inner = await self._fetch_forward(client, fid)
+                    if inner:
+                        nested = []
+                        for im in inner:
+                            inode = await self._build_content_node(
+                                client, im, None, depth + 1
+                            )
+                            if inode:
+                                nested.append(inode)
+                        if nested:
+                            nested_nodes = nested
+                continue
             usable.append(seg)
-        if not usable:
+        if not usable and not nested_nodes:
             return None
         # Prefer the group card (card), then the nickname, so QQ shows the
         # real name instead of falling back to the QQ number.
@@ -535,16 +563,28 @@ class ForwardFixPlugin(BasePlugin):
         data = {
             # NapCat requires string user_id for forward nodes.
             "user_id": str(user_id),
-            "content": usable,
+            "content": nested_nodes if nested_nodes is not None else usable,
         }
-        # Only include time when it is meaningful; time=0 (SnowLuma stored
-        # messages) would render as 1970 in the forward card.
+        # ALWAYS provide time: omitting it renders 1970 on older SnowLuma
+        # builds (no now-fallback in buildForwardPushBody).
         msg_time = int(msg.get("time") or 0)
-        if msg_time > 0:
-            data["time"] = msg_time
+        data["time"] = msg_time if msg_time > 0 else int(time.time())
         if nickname:
             data["nickname"] = str(nickname)
         return {"type": "node", "data": data}
+
+    async def _fetch_forward(self, client, res_id: str) -> list | None:
+        """Fetch a nested forward's messages via get_forward_msg (OneBot v11
+        extended action; SnowLuma supports it, NapCat/LLOneBot too)."""
+        try:
+            resp = await client.send_action(
+                "get_forward_msg", {"id": res_id}, timeout=15
+            )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                return resp.get("data", {}).get("messages") or []
+        except Exception as e:
+            logger.error("[forward_fix] get_forward_msg(%s) failed: %s", res_id, e)
+        return None
 
     async def _notify_failure(self, sid: str):
         """Optional user-visible failure notice (off by default)."""
