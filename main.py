@@ -12,10 +12,11 @@ _GROUP_SESSION_TYPES = {"gm"}
 _PRIVATE_SESSION_TYPES = {"dm"}
 
 # Segment types that MUST keep the original message ID node because their
-# content cannot be rebuilt from history (file upload, nested forward,
-# music signature). Everything else - including reply - goes through a
-# content node (user_id + time + content), which needs no ID lookup at all.
-_ID_NODE_TYPES = {"file", "forward", "music"}
+# content cannot be rebuilt (file upload, music signature). Nested forward
+# is expanded via get_forward_msg into content nodes (multi-level forward);
+# reply segments are textified to [引用 msg_id:xxx] so rendering does not
+# depend on the implementation's reply lookup.
+_ID_NODE_TYPES = {"file", "music"}
 
 
 class ForwardFixPlugin(BasePlugin):
@@ -391,7 +392,10 @@ class ForwardFixPlugin(BasePlugin):
 
     def _build_node(self, msg: dict, mid: str) -> dict | None:
         """Build a node for a message: content node, or ID node for
-        structure-sensitive segments (file / nested forward / music).
+        structure-sensitive segments (file / music). Nested forward
+        segments stay inside the content node as {type: forward, data:
+        {id}} - both NapCat and SnowLuma render them as nested forward
+        cards (multi-level forward).
         Returns None when the message cannot be represented (missing
         user_id / empty content) - the caller skips it instead of
         falling back to an ID node, because an unresolvable ID node
@@ -428,6 +432,16 @@ class ForwardFixPlugin(BasePlugin):
                 data = seg.get("data") or {}
                 if not (data.get("file") or data.get("url") or data.get("file_id")):
                     continue
+            elif stype == "reply":
+                # Textify the reply segment: rendering a reply inside a
+                # forward node requires the implementation to look up the
+                # quoted message (SnowLuma fails -> wrong/empty display).
+                # A plain text quote is always correct.
+                rid = (seg.get("data") or {}).get("id", "")
+                usable.append(
+                    {"type": "text", "data": {"text": f"[引用 msg_id:{rid}]"}}
+                )
+                continue
             usable.append(seg)
         if not usable:
             return None
@@ -444,9 +458,13 @@ class ForwardFixPlugin(BasePlugin):
         data = {
             # NapCat requires string user_id for forward nodes.
             "user_id": str(user_id),
-            "time": int(msg.get("time") or 0),
             "content": usable,
         }
+        # Only include time when it is meaningful; time=0 (SnowLuma stored
+        # messages) would render as 1970 in the forward card.
+        msg_time = int(msg.get("time") or 0)
+        if msg_time > 0:
+            data["time"] = msg_time
         if nickname:
             data["nickname"] = str(nickname)
         return {"type": "node", "data": data}
