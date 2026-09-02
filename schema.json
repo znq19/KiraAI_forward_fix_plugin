@@ -1,0 +1,15 @@
+{
+  "section_main": {
+    "type": "section",
+    "name": "基础设置",
+    "collapsed": false,
+    "fields": {
+      "silent_fail": {
+        "type": "switch",
+        "name": "失败时静默",
+        "default": true,
+        "hint": "开启：发送失败时只记日志，不向用户发任何提示（默认）。关闭：失败时向会话发送一条提示文本。"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "plugin_id": "forward_fix",
+  "display_name": "Forward Fix",
+  "version": "1.1.0",
+  "author": "znq19",
+  "description": "无感知修复 KiraAI 内置 <forward> 合并转发功能。拦截 after_xml_parse 阶段，直接调用 OneBot send_group_forward_msg / send_private_forward_msg API，对 LLM/官方逻辑/其他插件零侵入。",
+  "icon": "icon.png",
+  "tags": ["patch", "qq", "onebot"],
+  "core_version": ">=2.29.7",
+  "locales": {
+    "zh": {
+      "display_name": "合并转发修复",
+      "description": "修复内置合并转发功能，支持群聊/私聊，支持图片/视频/文件等媒体真实转发。"
+    }
+  }
+}
