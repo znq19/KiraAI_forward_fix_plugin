@@ -97,6 +97,13 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 <details>
 <summary><b>更新日志</b></summary>
 
+### v1.4.3（2026-09-02）
+
+- **修复**：回退转发时报 `message element "image" requires a file/url source`
+  - 原因：SnowLuma 存储的历史消息中图片段可能缺 `url`（rkey 过期/未解析），直接进内容节点会整体 1400
+  - 修复：内容节点构建时剔除无源的媒体段（image/record/video），全部剔除则该消息跳过
+- **修复**：SnowLuma 历史消息 `time` 为 0 时排序失效导致回退取错消息——仅当时间戳有效时才重排，否则保持实现返回顺序
+
 ### v1.4.2（2026-09-02）
 
 - **修复**：SnowLuma 下转发仍报 `forward node message_id xxx has no valid sender user_id`
