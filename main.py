@@ -347,10 +347,18 @@ class ForwardFixPlugin(BasePlugin):
 
     def _build_node(self, msg: dict, mid: str) -> dict | None:
         """Build a node for a message: content node, or ID node for
-        structure-sensitive segments (file / nested forward / music)."""
+        structure-sensitive segments (file / nested forward / music), or
+        ID node as a fallback when the content node cannot be built
+        (missing user_id / empty content in some implementations)."""
         if self._needs_id_node(msg):
             return {"type": "node", "data": {"id": mid}}
-        return self._build_content_node(msg)
+        node = self._build_content_node(msg)
+        if node is not None:
+            return node
+        # Content node not buildable - fall back to the ID node so the
+        # message is still forwarded (works when the implementation can
+        # resolve the ID, e.g. SnowLuma message store / NapCat client DB).
+        return {"type": "node", "data": {"id": mid}}
 
     @staticmethod
     def _needs_id_node(msg: dict) -> bool:
@@ -365,16 +373,19 @@ class ForwardFixPlugin(BasePlugin):
         """Build a content node (user_id + nickname + time + content) from a
         history / get_msg message."""
         segs = msg.get("message") or []
-        user_id = msg.get("user_id")
+        # Some implementations (e.g. SnowLuma) nest the sender under
+        # `sender.user_id` instead of a top-level `user_id`.
+        user_id = msg.get("user_id") or (msg.get("sender") or {}).get("user_id")
         if not segs or not user_id:
             return None
         # Prefer the group card (card), then the nickname, so QQ shows the
         # real name instead of falling back to the QQ number.
+        sender = msg.get("sender") or {}
         nickname = (
             msg.get("card")
             or msg.get("nickname")
-            or msg.get("sender", {}).get("card")
-            or msg.get("sender", {}).get("nickname")
+            or sender.get("card")
+            or sender.get("nickname")
             or ""
         )
         data = {
