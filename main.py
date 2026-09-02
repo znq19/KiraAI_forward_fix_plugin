@@ -269,6 +269,14 @@ class ForwardFixPlugin(BasePlugin):
                 )
                 nodes = []
                 for m in history[: len(message_ids)]:
+                    if self._needs_id_node(m):
+                        # file / music messages keep the ID node so NapCat
+                        # can resolve the real file; content nodes cannot
+                        # rebuild them.
+                        mid = m.get("message_id")
+                        if mid is not None:
+                            nodes.append({"type": "node", "data": {"id": mid}})
+                        continue
                     node = await self._build_content_node(client, m)
                     if node:
                         nodes.append(node)
@@ -509,6 +517,15 @@ class ForwardFixPlugin(BasePlugin):
         for seg in segs:
             stype = seg.get("type")
             if stype in ("image", "record", "video"):
+                data = seg.get("data") or {}
+                if not (data.get("file") or data.get("url") or data.get("file_id")):
+                    continue
+            elif stype in ("file", "music"):
+                # File / music segments: keep ONLY when a usable source
+                # exists (url/file/file_id) so NapCat can download and
+                # forward the real file. A source-less file segment makes
+                # NapCat's handleOb11FileLikeMessage throw "element not
+                # found" and fail the WHOLE forward - drop those.
                 data = seg.get("data") or {}
                 if not (data.get("file") or data.get("url") or data.get("file_id")):
                     continue
