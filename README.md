@@ -102,6 +102,11 @@ A：默认静默失败（只记日志）。如需用户可见的失败提示，�
 <details>
 <summary><b>更新日志</b></summary>
 
+### v1.5.4（2026-09-03）
+
+- **修复**：NapCat 下转发整体失败（`retcode 1200: element not found`）——嵌套转发展开的内层消息若含**无源 file/music 段**，NapCat 的 `handleOb11FileLikeMessage` 抛错并**拖垮整个转发**。修复：内容节点构建时**有源（url/file/file_id）的 file 段保留（真实转发文件），无源剔除**；外层 file 消息仍走 ID 节点，回退路径同步处理
+- **规范**：manifest 补 `repo` 字段
+
 ### v1.5.3（2026-09-03）
 
 - **修复**：嵌套转发"点进去是空的"——forward 段不再保留 `{id: message_id}`（会被实现当 res_id 用，指向不存在的资源 → 空卡片），改为调 `get_forward_msg` 展开成**嵌套内容节点**（纯 node 数组），SnowLuma 的 `uploadRecursive` / NapCat 的 `uploadForwardedNodesPacket` 原生渲染多层转发卡片
