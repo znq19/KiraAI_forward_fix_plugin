@@ -1,17 +1,17 @@
 {
   "plugin_id": "forward_fix",
   "display_name": "Forward Fix",
-  "version": "1.5.6",
+  "version": "2.0.0",
   "author": "znq19",
-  "description": "无感知修复 KiraAI 内置 <forward> 合并转发功能。拦截 after_xml_parse 阶段，直接调用 OneBot send_group_forward_msg / send_private_forward_msg API，对 LLM/官方逻辑/其他插件零侵入。",
+  "description": "无感知修复 KiraAI 内置 <forward> 合并转发。按 OneBot 实现（NapCat / LLOneBot / SnowLuma）自动分流节点形态，支持嵌套转发、真实引用气泡（内容/时间/昵称）、真实头像与昵称、图片/语音/视频/表情/文件全媒体。",
   "icon": "icon.png",
   "repo": "https://github.com/znq19/KiraAI_forward_fix_plugin",
   "tags": ["patch", "qq", "onebot"],
-  "core_version": ">=2.29.7",
+  "core_version": ">=2.33.1",
   "locales": {
     "zh": {
       "display_name": "合并转发修复",
-      "description": "修复内置合并转发功能，支持群聊/私聊，支持图片/视频/文件等媒体真实转发。"
+      "description": "修复内置合并转发功能：群聊/私聊、嵌套转发、真实引用气泡、真实头像昵称、全媒体与文件，兼容 NapCat / LLOneBot / SnowLuma。"
     }
   }
 }

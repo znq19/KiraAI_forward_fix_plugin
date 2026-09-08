@@ -1,212 +1,148 @@
-# KiraAI Forward Fix（合并转发修复插件）
+# KiraAI Forward Fix v2.0.0（合并转发修复）
 
-> 无感知修复 KiraAI 内置 `<forward>` 合并转发功能，让机器人能正常把多条消息合并转发到群聊 / 私聊。
+> 让 KiraAI 的 `<forward>` 合并转发在 **NapCat / LLOneBot / SnowLuma** 三家 OneBot 实现上**全部真实生效**：
+> 嵌套转发、引用气泡（内容/时间/昵称）、头像与昵称、图片/语音/视频/表情/名片/卡片/文件。
 
-## 这是什么？为什么要用它？
+## 为什么需要它
 
-KiraAI 内置的合并转发功能存在一个缺陷：当机器人使用 `<forward merge="true">` 标签合并转发多条消息时，OneBot 会报错：
+KiraAI 内置的 `<forward>` 标签会把 `{"type":"node"}` 段塞进 `send_group_msg`，OneBot 规定 node 段只能出现在合并转发专用接口里 → `retcode 1400`。
 
-```
-retcode 1400: message segment "node" is only valid inside a forward node list
-```
+本插件在 `after_xml_parse` 阶段拦截，改用 `send_group_forward_msg` / `send_private_forward_msg` 发送，并针对三家实现各自的节点解析规则选择最优节点形态。
 
-**原因**：内置实现把合并转发的 node 消息段当作普通消息发送（`send_group_msg`），而 OneBot 规定 node 段只能出现在合并转发专用接口（`send_group_forward_msg` / `send_private_forward_msg`）中。
+## 与旧版（v1.5.x）的区别
 
-**本插件**在消息发送前拦截合并转发请求，改用 OneBot 专用接口发送，从而修复该问题。
+旧版策略是"**先发 ID 节点，失败再整体回退内容节点**"。这在 SnowLuma 上是错的：SnowLuma 遇到**无法解析的 id 节点会直接让整条转发失败**（`INVALID_FIELD: forward node message_id not found`），于是每次转发都要先失败一次再重试，而且回退后的内容节点会丢失文件、嵌套卡片和原生引用。
 
-> **💡 本插件最大的意义**：解决**非 NapCat**（如 **SnowLuma**、**LLOneBot**）配合 KiraAI 无法正常合并转发的问题。
-> NapCat 走 NTQQ 客户端数据库，内置实现勉强可用；但 SnowLuma / LLOneBot 只在自己的消息存储中反查消息，内置实现（按 ID 引用节点）必然失败。本插件改用**内容节点**（自带发送者信息，零反查），跨实现可靠。
+v2 改为：
 
-## 特性
+1. **先探测实现**（`get_version_info` → `NapCat.Onebot` / `LLOneBot` / `SnowLuma`）；
+2. **逐条消息选择节点形态**，绝不把 SnowLuma 解析不了的 id 交给它；
+3. 发送失败时按**分级回退**（全内容节点 → 去掉引用 → 去掉嵌套），而不是整体重来。
 
-- ✅ **对 LLM 完全透明**：不注册新工具、不修改提示词，机器人完全无感知
-- ✅ **对官方逻辑零侵入**：只处理合并转发，其他消息原样放行
-- ✅ **对其他插件无影响**：高优先级执行，只匹配 Forward 类型
-- ✅ **完全静默**：默认成功/失败都不发提示文本（可配置）
-- ✅ **群聊 / 私聊都支持**：自动根据会话类型选择对应接口
-- ✅ **媒体真实转发**：所有普通消息（文本/图片/语音/视频/表情）走内容节点原样重发（含真实昵称，群名片优先），不依赖消息 ID 反查，兼容 NapCat / SnowLuma / LLOneBot
-- ✅ **嵌套转发**：转发已有的聊天记录（多层转发）时，forward 段保留在内容节点内，QQ 客户端原生渲染嵌套卡片
-- ✅ **引用真实显示**：reply 段先探测被引用消息是否可解析——可解析保留原生引用气泡（内容+时间正确），不可解析文本化 `[引用 msg_id:xxx]` 保底，显示永不出错
-- ✅ **指哪打哪**：历史窗口外的消息 ID 逐个调 `get_msg` 精确解析，不再回退猜最近 N 条；仅当大部分 ID 无法解析时才回退（防 LLM 幻觉 ID）
-- ✅ **零配置**：装上即用，自动识别 QQ 平台
+## 三家实现的行为（源码实锤）
+
+| | id 节点未命中 | 内容节点发送者 | 嵌套转发 | 内容节点文件 | 引用段 |
+|---|---|---|---|---|---|
+| **NapCat** | 静默跳过该节点 | packet 模式保留 `user_id/nickname/time`；非 packet 模式**变成机器人身份** | 原生递归（≤3 层） | 会下载 `data.url`，历史 URL 过期会拖垮整条转发 → 内容节点一律剔除 | 只认 `id`（全局唯一表），传 `seq` 会按**目标会话**查序列 |
+| **LLOneBot** | 静默跳过该节点 | 保留 `uin/name/time` | 原生递归 | 需要 `url`/本地路径 | 只认 `id`（自己的 shortId），查不到只跳过该段 |
+| **SnowLuma** | **整条转发硬失败** | 保留 `user_id/nickname/time` | 原生递归（≤3 层） | `file_id` 或可加载 `url` 均可（会用 url 重新上传到目标会话） | `id` 经 store 解析，解析不到则该段跳过 |
+
+因此 v2 的选择是：
+
+- **NapCat / LLOneBot**：优先 **id 节点**（原生复用原消息：文件、嵌套卡片、引用气泡全部保真），并把 `user_id/nickname/time` 一并带上做兜底；失败后回退内容节点。
+- **SnowLuma**：**内容节点优先**。原因是它的 id 节点路径同样要把每个元素重新打包上传，但用的是 **store 里的旧副本**（图片 URL 不会刷新）、引用段没有 resolver（正数 id 被当序列）、嵌套卡片没有 piggyback uuid（收方可能打不开）。我们自己重建内容节点可以：拿到 `get_msg` 刷新过的图片 URL、注入被引用消息的真实 `message_seq`、把嵌套转发展开成带 piggyback 的 innerForward 链。只有在内容节点完全无法构造时，才回退到 id 节点，且必须先过它的 forward 场景校验（`user_id>0`、video 不能有兄弟段、不能有 poke、c2c 每节点最多 1 个文件、无未知段型）。
+- 未知实现：id 优先 + 内容回退（旧行为）。
+
+## 功能清单
+
+- ✅ 群聊 / 私聊（`send_group_forward_msg` / `send_private_forward_msg`）
+- ✅ **嵌套转发**：id 节点走原生嵌套卡片；内容回退路径用 `get_forward_msg` 展开成纯 node 数组，深度按三家上限（3 层）截断，超深自动用 `[聊天记录]` 占位而不是失败
+- ✅ **引用气泡真实**（按实现分流，这是 v2 的关键修正）：
+  - **NapCat / LLOneBot**：引用段保留**原始 message_id**（NapCat 走全局唯一表、LLOneBot 走自己的 shortId store），**绝不写 `seq`**（NapCat 的 `get_msg` 会把 `message_seq` 覆盖成短 id，写 seq 会引用错位）；
+  - **SnowLuma**：它的转发节点解析 `parseForwardNodes` 调 `parseMessage(content, false)` **不传 `resolveReplySequence`**，因此正数 reply id 会被当作 **QQ 序列号**；插件因此在 SnowLuma 路径下改为注入被引用消息的**真实 `message_seq`**，并把含引用的消息改走内容节点（id 节点里缓存的引用 id 是哈希，会被误读成序列）；
+  - 所有实现都先 `get_msg` 探测引用目标，不可解析则丢弃（可选文本化），**绝不发送坏引用**；
+  - SnowLuma 的文件段**只发 `url` 或只发 `file_id`，绝不同时发**（它的 `prepareForwardFileElement` 见到 file_id 就跳过 url 重传分支，文件不在目标作用域缓存时会直接抛错）。
+- ✅ **头像与昵称**：节点携带真实 `user_id` + `nickname`（群名片优先）；id 节点由实现原生解析
+- ✅ **每个节点独立时间**：`time` 为 unix 秒，总是提供（缺失用当前时间），不会渲染成 1970
+- ✅ **全媒体**：图片 / 语音 / 视频 / 表情 / 商城表情 / 名片 / JSON 卡片 / markdown；无可用源的媒体段会被丢弃而不是让整条转发失败
+- ✅ **文件**：NapCat/LLOneBot 走 id 节点原生转发；SnowLuma 内容节点用 `url`（重新上传）或 `file_id`
+- ✅ **卡片外显**：`source / summary / prompt / news`（前 4 行"昵称: 预览"）
+- ✅ **保序 + 去重**：严格按 LLM 给出的 id 顺序（旧版会把 `get_msg` 补的放最后导致乱序）
+- ✅ **幻觉防护**：解析率 < 50% 时回退到最近 N 条真实历史（按时间升序）
+- ✅ `merge="false"` 单条转发走 `forward_group_single_msg` / `forward_friend_single_msg`，不支持时自动降级为节点转发
+- ✅ 完全静默（可配置失败提示）；对 LLM / 官方逻辑 / 其他插件零侵入
 
 ## 安装
 
-1. 下载最新版插件压缩包（`forward_fix_plugin_v1.5.0.zip`）
-2. 解压到 KiraAI 的 `data/plugins/` 目录下，确保目录结构为：
+1. 把本仓库内容（至少 `main.py` / `manifest.json` / `schema.json` / `icon.png`）放到 `data/plugins/forward_fix/`；
+   `tests/`、`PLAN.md`、`README.md` 仅用于验证与说明，运行时不需要：
 
 ```
-data/plugins/
-└── forward_fix/
-    ├── main.py
-    ├── manifest.json
-    ├── schema.json
-    └── icon.png
+data/plugins/forward_fix/
+├── main.py
+├── manifest.json
+├── schema.json
+└── icon.png
 ```
 
-3. 在 KiraAI 的插件管理页面（或 `data/config/plugins.json`）中启用 `forward_fix` 插件
-4. 重启 KiraAI（或触发插件热重载）
+2. 在插件管理页启用 `forward_fix`（或修改 `data/config/plugins.json`），重启或热重载。
 
-## 使用
+## 配置
 
-**无需任何配置**。安装并启用后，让机器人合并转发消息即可：
+| 配置项 | 类型 | 默认 | 说明 |
+|--------|------|------|------|
+| `silent_fail` | 开关 | `true` | 失败时只记日志；关闭后失败会向会话发一条提示 |
+| `reply_mode` | 枚举 | `native` | `native`：引用可解析则保留原生气泡，不可解析丢弃；`drop`：一律丢弃引用段；`textify`：可解析时渲染为 `[引用 昵称: 内容]` 文本 |
+| `max_depth` | 整数 | `3` | 嵌套转发展开层数上限（三家客户端都最多 3 层） |
+| `prefer_content_nodes` | 开关 | `false` | 强制内容节点（排查问题用） |
+| `debug` | 开关 | `false` | 记录每个被丢弃消息段的类型与异常堆栈 |
+| `loss_report` | 开关 | `false` | 有内容无法转发时，转发成功后向会话发一条丢失清单（日志始终有 WARNING） |
+| `debug_dump` | 开关 | `false` | 把实际发送的节点 JSON 写入日志，便于实机核对 |
 
-> 用户：把群里最近 10 条消息合并转发到这个群
+**无需配置即可使用。** 日志中会打印 `[forward_fix] target=napcat ids=[...] merge=True` 以及节点形态与回退级别。
 
-机器人会正常输出 `<forward merge="true">消息ID列表</forward>`，插件自动拦截并改用 OneBot 专用接口发送。
+## 严格校验兜底（避免"一个段毁掉整条转发"）
 
-## 配置项
+SnowLuma 的校验是"要么整条成功、要么整条失败"，因此内容节点在构造时就会剔除会让它硬失败的段：
+- `json` 的 `data` 为空/缺失（它的 codec 会抛 `INVALID_FIELD`）
+- `mface` 缺 `emoji_id`
+- `video` 带兄弟段（只保留 video）
+- `poke` / `shake`（forward 场景禁止）
+- 仅接收型段（`flashtransfer` / `onlinefile` / `flash_file`）
+- 未知段型（它的 `parseMessage` 会抛 `UNKNOWN_TYPE`）
+- c2c 节点内第二个及以后的 `file`
+- 无可用源的 image / record / video / file
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `silent_fail` | 开关 | `true` | 发送失败时是否静默。开启：只记日志，不打扰用户；关闭：失败时向会话发送一条提示文本 |
+每个被剔除的段都会记日志（`debug` 开启后更详细），不会静默。
+
+## 已知限制
+
+1. **跨会话引用气泡**：QQ 的转发卡片里，引用段记录的是原消息在其**原会话**中的序列号。若把 A 群的消息转发到 B 群，QQ 客户端可能无法展开引用内容（显示为空/不可见）。这是 QQ 客户端行为，三家协议端都无法绕过；插件已做到"能解析就发原生引用、解析不了就丢弃"，不会出现错位引用。
+2. **NapCat 非 packet 模式**（`packetBackend: "disable"`）下内容节点会丢失原发送者身份。插件默认优先 id 节点，因此只要 id 可解析就不受影响；id 全失败时才会落到内容节点。建议保持 NapCat 默认的 `packetBackend: "auto"`。
+3. **嵌套深度上限 3 层**：三家协议端与 QQ 客户端一致，更深的层级会被截断（插件用 `[聊天记录]` 占位，不会报错）。
 
 ## 工作原理
 
 ```
 LLM 输出 <forward merge="true">id1,id2</forward>
-        ↓
-内置 ForwardTag 解析为 Forward 元素（MessageChain 内）
-        ↓
-本插件在 after_xml_parse 阶段拦截：
-  1. 从消息链中移除 Forward 元素
-  2. 自动拉取真实历史（get_group_msg_history / get_friend_msg_history）
-  3. 匹配消息 ID，构造内容节点：
-     - 普通消息（含引用回复）→ 内容节点（user_id + nickname + time + content）原样重发
-     - 文件/嵌套转发/音乐卡片 → 真实 ID 节点保留结构
-     - 历史窗口外的 ID → 逐个调 get_msg 精确解析，查不到才跳过
-  4. 直接调用 OneBot 专用接口：
-     - 群聊 → send_group_forward_msg
-     - 私聊 → send_private_forward_msg
-        ↓
-OneBot 正常发送合并转发 ✅
+        ↓ 内置 ForwardTag → Forward 元素
+插件在 after_xml_parse 拦截：
+  1. 探测实现（get_version_info）
+  2. 拉历史 + 逐条 get_msg 解析 id（保序、去重、幻觉防护）
+  3. 逐条选节点：
+       NapCat/LLOneBot → id 节点（带 user_id/nickname/time 兜底）
+       SnowLuma        → 先验证 id 是否可解析且通过 forward 校验，否则内容节点
+  4. 调 send_group_forward_msg / send_private_forward_msg（含卡片外显）
+  5. 失败分级回退：全内容节点 → 去引用 → 去嵌套
 ```
 
-> **为什么不用纯 ID 节点？** 按 ID 引用消息时，OneBot 实现需要反查发送者：NapCat 走 NTQQ 客户端数据库（能查到），但 SnowLuma / LLOneBot 只在自己的消息存储（仅含启动后收到的消息）中反查，历史接口返回的 ID 不在其中就会报 `has no valid sender user_id`。内容节点自带发送者信息，不依赖反查，跨实现可靠。
+## 验证
 
-## 常见问题
+**① 超集回归测试（对真实 v1.5.6 代码）**：`tests/test_superset.py` 会加载仓库里的 v1.5.6 原始 `main.py`（`tests/baseline_v1_5_6.py`），把同一套 26 个场景分别喂给 v1.5.6 和 v2，对三家实现逐对比较"是否成功发送"：
 
-**Q：安装后没有效果？**
-A：请检查：① 插件是否已启用；② 日志中是否出现 `[forward_fix]` 相关记录；③ 你的 OneBot 实现（如 NapCat）是否支持 `send_group_forward_msg` 接口。
+```
+26 场景 × 3 实现 = 78 对
+v1.5.6 成功 / v2 失败（回归）：0
+v1.5.6 失败 / v2 成功（新增）：2（SnowLuma 的 video+兄弟段、json 空 data）
+```
 
-**Q：会和其他插件冲突吗？**
-A：不会。插件只处理 `Forward` 类型的消息元素，其他消息原样放行。
+过程中真实抓到并修掉两个"v1.5.6 能发、v2 曾发不出"的回归点：
+1. v1.5.6 **无条件发 id 节点**（即使消息没有 user_id）；v2 一度因缺 uid 跳过该节点 → 已改成 id 节点不依赖 uid；
+2. 一条**只有引用、被引用消息查不到、且被引用 id 为正数**的消息：v1.5.6 在 SnowLuma 上会发成功（引用是错的），v2 一度会发失败 → 已改成这种极窄情况下退回 id 节点，与 v1.5.6 对齐（其余含引用的消息仍走内容节点用真实 `message_seq` 修正引用）。
 
-**Q：失败时会怎样？**
-A：默认静默失败（只记日志）。如需用户可见的失败提示，可在插件配置中关闭 `silent_fail`。
+**② 引用语义演示**：`tests/demo_reply_semantics.py` 打印 v1.5.6 / v2 在 SnowLuma 上实际渲染出的 `replySeq`，证明"发送成功 ≠ 引用正确"。
 
-## 已知问题
+即：**在按源码建模的规则下，v2 是 v1.5.6 的严格超集**——v1.5.6 能发成功的场景 v2 全部能发成功，另有更多场景能成功。
 
-> ⚠️ **NapCat 和 SnowLuma 使用本插件修复的转发消息，引用气泡仍可能存在转发后显示异常的情况**（如引用错位、引用条为空）。已尽力调整（探测引用目标、保留原始消息 ID、剔除不可解析引用段等），但受限于各 OneBot 实现的引用反查机制差异，暂时未找到彻底解决的办法。**大家可按需取舍安装**——若你的场景强依赖转发中的引用气泡完全保真，请评估后再启用本插件。
+**② 规则矩阵测试**：`tests/` 内含 KiraAI 框架 mock + 按三家源码规则编写的 OneBot 模拟器（id 命中/未命中、硬失败、嵌套深度、video 策略、poke 策略、文件源要求、引用 id/seq、json/mface 必填、丢失清单等），共 **53 项断言全部通过**：
 
-## 开源协议
+```bash
+python3 tests/test_matrix.py    # 53 项规则矩阵
+python3 tests/test_superset.py  # v1.5.6 超集回归对比
+```
 
-本项目基于 [GNU Affero General Public License v3.0](LICENSE) 开源。
+覆盖：三家 × {文本、图片、语音、视频、文件（url/file_id/无源）、引用（可解析/不可解析/textify/drop）、嵌套（1 层/4 层/展开失败）、poke、视频+兄弟段、ghost id、幻觉 id、merge=false、私聊无历史接口、未知实现、非 QQ 平台}。
 
-<details>
-<summary><b>更新日志</b></summary>
+## 许可
 
-### v1.5.6（2026-09-03）
-
-- **修复引用错位 + SnowLuma reply 报错（根因实锤）**：v1.5.2 起把 reply 段改写为 `{id: seq, seq: seq}`（seq=探测的 `message_seq`），但 **NapCat 的 `get_msg` 把 `message_seq` 覆盖成短哈希 message_id**（`action/msg/GetMsg.ts`：`retMsg.message_seq = retMsg.message_id`）——它不是 QQ 权威 seq！NapCat 发送侧 `seq` 分支用假 seq 查 `getMsgsBySeqAndCount` → **查到错误消息 → 引用错位**；SnowLuma 的 `resolveReplySequence(messageId)` 用 message_id 反查 store，传 seq 进去反查失败 → 旧版抛 `message segment "reply" is missing required or usable fields`
-- **修复**：reply 段**保留原始 message_id，不再改写 seq**——NapCat 走 `id` 分支 `getMsgIdAndPeerByShortId` 反查真实消息、SnowLuma 走 `resolveReplySequence(id)` 反查 store、LLOneBot 标准兼容（这就是 LLOneBot 引用完全真实的原因）
-- **不丢弃**：不可解析的 reply 段**剔除段、保留消息其余内容**（不再整条跳过）；探测闭环不变（get_msg 能查到 ⇔ reply 能渲染，同一消息存储）
-
-### v1.5.5（2026-09-03）
-
-- **策略反转：ID 节点优先 + 内容节点回退**（分流）——之前"内容节点优先"反而破坏了 NapCat 的原生能力（不装插件时 KiraAI 直接发 node 段，NapCat 从客户端数据库反查，图片/文件/嵌套全真实）。现在：**先发 ID 节点**（NapCat/LLOneBot 第一次就成功，与不装插件行为完全一致）；**失败自动回退内容节点**（SnowLuma 路径：file/music 段剔除、reply 改写权威 seq、嵌套 forward 展开）；回退仍失败再剔除 reply 节点重试
-- **回退路径强制内容节点**：`_build_node` 加 `force_content` 参数——ID 节点发送已失败时，file/music 消息也重建为内容节点（段剔除、文本保留），不再放回 ID 节点（会因同样原因再挂）
-
-### v1.5.4（2026-09-03）
-
-- **修复**：NapCat 下转发整体失败（`retcode 1200: element not found`，栈 `handleOb11FileLikeMessage` → `at async file`）——内容节点里的 **file 段** NapCat 会尝试下载 `data.url`，历史消息的 url 通常已过期 → 下载失败 → **拖垮整个转发**。修复：内容节点构建时 **file/music 段一律剔除**（外层 file 消息走 ID 节点，NapCat 从客户端数据库反查真实文件，不依赖 url 下载）；image/record/video 有源保留（NapCat 实测正常）
-- **规范**：manifest 补 `repo` 字段
-
-### v1.5.3（2026-09-03）
-
-- **修复**：嵌套转发"点进去是空的"——forward 段不再保留 `{id: message_id}`（会被实现当 res_id 用，指向不存在的资源 → 空卡片），改为调 `get_forward_msg` 展开成**嵌套内容节点**（纯 node 数组），SnowLuma 的 `uploadRecursive` / NapCat 的 `uploadForwardedNodesPacket` 原生渲染多层转发卡片
-- **修复**：转发卡片时间显示 1970——节点 `time` 字段**总是提供**（消息时间或当前时间兜底），旧版 SnowLuma 省略 time 会渲染 1970
-- **保持**：reply 段改写 `{id: seq, seq: seq}`（QQ 权威序列），SnowLuma 渲染真实引用跳转、NapCat 按 seq 查真实消息显示完整引用条
-
-### v1.5.2（2026-09-03）
-
-- **修复**：引用消息"成功且真实"——reply 段探测升级为**提取被引用消息的 QQ 权威序列（message_seq）**，并改写为 `{id: seq, seq: seq}`，三端全部真实渲染：
-  - **SnowLuma**：reply codec 读 `data.id`，正数直接当 QQ 序列渲染真实引用气泡（旧版对负数 message_id 哈希会报 1400——这是之前转发失败的根因）
-  - **NapCat**：reply 转换优先用 `data.seq` 按序列查真实消息
-  - **LLOneBot**：标准 OneBot reply 段，id=seq 兼容
-- **修复**：被引用消息无法解析（get_msg 失败或无 message_seq）时**整条跳过**——绝不文本化、绝不发送残缺 reply，转发的每条消息都是真实引用
-- **保持**：发送失败时剔除含 reply 的节点重试一次（不文本化），保证其余消息真实转发成功
-
-### v1.5.1（2026-09-03）
-
-- **修复**：引用消息显示真实样子——reply 段先调 `get_msg` 探测被引用消息是否可解析
-  - 可解析（NapCat 走客户端数据库几乎总是；SnowLuma 被引用消息在 store 内）→ **保留原生 reply 段**，QQ 渲染真实引用气泡（内容 + 时间正确）
-  - 不可解析 → 文本化 `[引用 msg_id:xxx]` 保底，显示永不出错
-- **原理**：get_msg 与 reply 反查走同一消息存储（SnowLuma 的 findMeta），get_msg 能查到 ⇔ reply 段能正常渲染
-
-### v1.5.0（2026-09-02）
-
-- **新增**：嵌套转发支持——转发已有的聊天记录（多层转发）时，forward 段保留在内容节点内，QQ 客户端原生渲染嵌套卡片（NapCat / SnowLuma 均支持）
-- **修复**：引用消息的时间/引用显示——reply 段文本化为 `[引用 msg_id:xxx]`，不依赖实现的反查（SnowLuma 反查失败会显示错误）；`time` 为 0 时省略字段，避免显示 1970
-- **优化**：README 说明本插件最大意义是解决非 NapCat（SnowLuma / LLOneBot）配合 KiraAI 无法正常合并转发的问题
-
-### v1.4.3（2026-09-02）
-
-- **修复**：回退转发时报 `message element "image" requires a file/url source`
-  - 原因：SnowLuma 存储的历史消息中图片段可能缺 `url`（rkey 过期/未解析），直接进内容节点会整体 1400
-  - 修复：内容节点构建时剔除无源的媒体段（image/record/video），全部剔除则该消息跳过
-- **修复**：SnowLuma 历史消息 `time` 为 0 时排序失效导致回退取错消息——仅当时间戳有效时才重排，否则保持实现返回顺序
-
-### v1.4.2（2026-09-02）
-
-- **修复**：SnowLuma 下转发仍报 `forward node message_id xxx has no valid sender user_id`
-  - 原因：纯引用消息（只有 reply 段）在 SnowLuma 中 reply 段转换失败被跳过 → `message` 数组为空 → 内容节点构建失败 → v1.4.1 回退 ID 节点 → 反查失败 → 整体 1400
-  - 修复：内容节点构建失败时**跳过该消息**（不再回退 ID 节点），其余消息正常转发；发送失败且含 ID 节点时自动剔除 ID 节点重试一次，保证能转的消息一定转出去
-- **修复**：LLM 轻微幻觉 ID（如把 `1159489171` 写成 `1159489101`）时，该条被跳过并记日志，不再影响其他消息
-
-### v1.4.1（2026-09-02）
-
-- **修复**：SnowLuma 下转发最近 10 条全部失败（`no nodes to send`）
-  - 原因：部分实现（如 SnowLuma）历史消息把发送者放在 `sender.user_id` 嵌套结构，顶层 `user_id` 缺失 → 内容节点构建失败 → 节点列表为空
-  - 修复：`user_id` 兼容 `sender.user_id` 嵌套结构；内容节点构建失败时回退为 ID 节点（实现能反查时仍可转发），不再静默丢弃
-
-### v1.4.0（2026-09-02）
-
-- **修复**：合并转发中部分用户不显示 QQ 昵称（显示为 QQ 号）
-  - 原因：内容节点只传了 `user_id`，QQ 客户端无昵称时回退显示 QQ 号
-  - 修复：内容节点补充 `nickname` 字段（群名片优先，其次昵称）
-- **修复**：转发"指哪打哪"——LLM 引用历史窗口外的消息（如回复目标）时不再回退猜最近 N 条
-  - 新增：历史中未匹配的 ID 逐个调 `get_msg(id)` 精确解析（NapCat 走客户端数据库、SnowLuma 走消息存储），查得到就精确转发，查不到才跳过
-  - 仅当大部分 ID 都无法解析时才回退最近 N 条（防 LLM 幻觉 ID）
-
-### v1.3.0（2026-09-02）
-
-- **修复**：SnowLuma / LLOneBot 下合并转发仍报 `has no valid sender user_id`
-- **根因**：按消息 ID 引用节点时，SnowLuma / LLOneBot 在自己的消息存储（仅含启动后收到的消息）中反查发送者，历史接口返回的 ID 不在其中即失败；NapCat 走 NTQQ 客户端数据库所以正常
-- **方案**：内容节点优先——所有普通消息（含引用回复）一律构造完整内容节点（`user_id` + `time` + `content`）原样重发，完全不需要 ID 反查；仅文件/嵌套转发/音乐卡片保留 ID 节点
-- **兼容性**：内容节点是 OneBot v11 标准格式，NapCat / SnowLuma / LLOneBot 均支持
-
-### v1.2.0（2026-09-02）
-
-- **修复**：合并转发报 `forward node message_id xxx has no valid sender user_id`（retcode 1400）
-- **根因**：按消息 ID 引用节点时，NapCat 需反查每条消息的发送者，ID 不在缓存（消息较旧/跨会话/LLM 幻觉 ID）即失败
-- **方案**：改为混合节点——发送前自动拉取真实历史（`get_group_msg_history` / `get_friend_msg_history`），普通消息（文本/图片/语音/视频/表情）构造完整内容节点（`user_id` + `time` + `content`）原样重发，不依赖 ID 反查；文件/嵌套转发/引用/卡片/音乐等结构敏感消息保留真实 ID 节点
-- **新增**：ID 匹配率低于 50% 时自动判定 LLM 幻觉 ID，回退为转发最近 N 条真实历史消息
-- **新增**：节点 `user_id` 强制字符串类型（NapCat 要求 string，传数字会 1400）
-
-### v1.1.0（2026-09-02）
-
-- **修复**：平台判断改为大小写不敏感（兼容 `QQ` / `qq` 配置）
-- **修复**：会话类型精确匹配 `gm`（群聊）/ `dm`（私聊），不再猜测未知类型
-- **修复**：`send_action` 超时提升到 30 秒，兼容大消息合并转发
-- **修复**：消息 ID 解析失败时保留原消息链交给内置发送器，避免静默吞消息
-- **新增**：`silent_fail` 配置开关（默认开启，失败静默；关闭则发送提示文本）
-- **新增**：适配器 / 客户端判空保护，失败时输出明确错误日志
-- **优化**：注释全部改为英文，符合 KiraAI 插件开发规范
-
-### v1.0.0（2026-08-26）
-
-- 初始版本：拦截 `after_xml_parse` 阶段的 Forward 元素，直接调用 OneBot 合并转发专用接口
-- 支持群聊 / 私聊合并转发
-
-</details>
+GNU Affero General Public License v3.0

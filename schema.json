@@ -1,4 +1,10 @@
 {
+  "info_intro": {
+    "type": "info",
+    "name": "说明",
+    "hint": "插件会自动探测 OneBot 实现（NapCat / LLOneBot / SnowLuma）并选择最优的节点形态，通常无需改动任何配置。",
+    "level": "info"
+  },
   "section_main": {
     "type": "section",
     "name": "基础设置",
@@ -9,6 +15,49 @@
         "name": "失败时静默",
         "default": true,
         "hint": "开启：发送失败时只记日志，不向用户发任何提示（默认）。关闭：失败时向会话发送一条提示文本。"
+      },
+      "reply_mode": {
+        "type": "enum",
+        "name": "引用不可解析时的处理",
+        "options": [
+          "native",
+          "drop",
+          "textify"
+        ],
+        "default": "native",
+        "hint": "native：引用目标可解析时保留原生引用气泡（内容/时间/昵称真实），不可解析则丢弃该段（默认）；drop：一律丢弃引用段；textify：可解析时改渲染为 [引用 昵称: 内容] 文本，不可解析仍丢弃。"
+      },
+      "max_depth": {
+        "type": "integer",
+        "name": "嵌套转发最大层数",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 3,
+        "hint": "QQ 客户端与三家实现都最多支持 3 层转发卡片，超过的嵌套会被丢弃。"
+      },
+      "prefer_content_nodes": {
+        "type": "switch",
+        "name": "强制使用内容节点",
+        "default": false,
+        "hint": "默认优先使用 id 节点（保留原消息全部细节）。开启后强制重建内容节点，仅用于排查问题。"
+      },
+      "debug": {
+        "type": "switch",
+        "name": "调试日志",
+        "default": false,
+        "hint": "开启后记录每个被丢弃消息段的类型与异常堆栈，便于定位问题。"
+      },
+      "loss_report": {
+        "type": "switch",
+        "name": "丢失清单提示",
+        "default": false,
+        "hint": "开启后，若某些消息/消息段无法转发，会在转发成功后向会话发一条清单（同时始终写入日志 WARNING）。"
+      },
+      "debug_dump": {
+        "type": "switch",
+        "name": "转储发送载荷",
+        "default": false,
+        "hint": "把实际发送给 OneBot 的节点 JSON 写入日志，便于实机核对。"
       }
     }
   }
