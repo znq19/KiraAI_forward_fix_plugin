@@ -118,30 +118,31 @@ LLM 输出 <forward merge="true">id1,id2</forward>
 
 ## 验证
 
-**① 超集回归测试（对真实 v1.5.6 代码）**：`tests/test_superset.py` 会加载仓库里的 v1.5.6 原始 `main.py`（`tests/baseline_v1_5_6.py`），把同一套 26 个场景分别喂给 v1.5.6 和 v2，对三家实现逐对比较"是否成功发送"：
+**① 规则矩阵测试**：`tests/` 内含 KiraAI 框架 mock + 按三家源码规则编写的 OneBot 模拟器（id 命中/未命中、硬失败、嵌套深度、video 策略、poke 策略、文件源要求、引用 id/seq、json/mface 必填、丢失清单等），共 **53 项断言全部通过**：
+
+```bash
+python3 tests/test_matrix.py    # 53 项规则矩阵
+```
+
+覆盖：三家 × {文本、图片、语音、视频、文件（url/file_id/无源）、引用（可解析/不可解析/textify/drop）、嵌套（1 层/4 层/展开失败）、poke、视频+兄弟段、ghost id、幻觉 id、merge=false、私聊无历史接口、未知实现、非 QQ 平台}。
+
+**② 超集回归测试（对真实 v1.5.6 代码）**：`tests/test_superset.py` 直接从 **git 历史**读取本 PR 的基线（ref `2ccd3f4`，即上游 main 的旧 `main.py`；仓库里不存放旧代码副本），把同一套 26 个场景分别喂给 v1.5.6 和 v2，对三家实现逐对比较"是否成功发送"：
+
+```bash
+python3 tests/test_superset.py  # 26 场景 × 3 实现 = 78 对
+```
 
 ```
-26 场景 × 3 实现 = 78 对
 v1.5.6 成功 / v2 失败（回归）：0
 v1.5.6 失败 / v2 成功（新增）：2（SnowLuma 的 video+兄弟段、json 空 data）
 ```
 
 过程中真实抓到并修掉两个"v1.5.6 能发、v2 曾发不出"的回归点：
+
 1. v1.5.6 **无条件发 id 节点**（即使消息没有 user_id）；v2 一度因缺 uid 跳过该节点 → 已改成 id 节点不依赖 uid；
 2. 一条**只有引用、被引用消息查不到、且被引用 id 为正数**的消息：v1.5.6 在 SnowLuma 上会发成功（引用是错的），v2 一度会发失败 → 已改成这种极窄情况下退回 id 节点，与 v1.5.6 对齐（其余含引用的消息仍走内容节点用真实 `message_seq` 修正引用）。
 
-**② 引用语义演示**：`tests/demo_reply_semantics.py` 打印 v1.5.6 / v2 在 SnowLuma 上实际渲染出的 `replySeq`，证明"发送成功 ≠ 引用正确"。
-
 即：**在按源码建模的规则下，v2 是 v1.5.6 的严格超集**——v1.5.6 能发成功的场景 v2 全部能发成功，另有更多场景能成功。
-
-**② 规则矩阵测试**：`tests/` 内含 KiraAI 框架 mock + 按三家源码规则编写的 OneBot 模拟器（id 命中/未命中、硬失败、嵌套深度、video 策略、poke 策略、文件源要求、引用 id/seq、json/mface 必填、丢失清单等），共 **53 项断言全部通过**：
-
-```bash
-python3 tests/test_matrix.py    # 53 项规则矩阵
-python3 tests/test_superset.py  # v1.5.6 超集回归对比
-```
-
-覆盖：三家 × {文本、图片、语音、视频、文件（url/file_id/无源）、引用（可解析/不可解析/textify/drop）、嵌套（1 层/4 层/展开失败）、poke、视频+兄弟段、ghost id、幻觉 id、merge=false、私聊无历史接口、未知实现、非 QQ 平台}。
 
 ## 许可
 
